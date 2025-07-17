@@ -56,8 +56,8 @@ pub struct Mod {
 }
 
 impl Mod {
-	fn read_from(manifest_path: Box<Path>) -> Result<Self, (std::io::Error, Box<Path>)> {
-		let json_data = match std::fs::read_to_string(&manifest_path) {
+	async fn read_from(manifest_path: Box<Path>) -> Result<Self, (std::io::Error, Box<Path>)> {
+		let json_data = match tokio::fs::read_to_string(&manifest_path).await {
 			Ok(d) => d,
 			Err(e) =>
 				return Err((
@@ -243,7 +243,9 @@ pub struct ModGroup {
 	pub mods: BTreeSet<UniqueId>
 }
 
-pub fn collect_mods_in_path(
+// TODO: Refactor to be non-recursive to avoid all the currently-necessary `Box::pins` (due to not
+// being able to natively represent recursive functions)
+pub async fn collect_mods_in_path(
 	path: &Path,
 	sender: &Sender<AppMsg>,
 	id_accum: &mut BTreeSet<UniqueId>
@@ -256,7 +258,7 @@ pub fn collect_mods_in_path(
 		return;
 	}
 
-	let Ok(dir) = std::fs::read_dir(path).inspect_err(|e| {
+	let Ok(mut dir) = tokio::fs::read_dir(path).await.inspect_err(|e| {
 		_ = sender.send(AppMsg::UserRelevantError(format!(
 			"Couldn't check for mods inside {path:?}: {e}"
 		)))
@@ -264,16 +266,19 @@ pub fn collect_mods_in_path(
 		return;
 	};
 
-	for entry in dir {
-		let Ok(entry) = entry.inspect_err(|e| {
-			_ = sender.send(AppMsg::UserRelevantError(format!(
-				"Couldn't check for mods inside {path:?}: {e}"
-			)))
-		}) else {
-			continue;
+	loop {
+		let entry = match dir.next_entry().await {
+			Err(e) => {
+				_ = sender.send(AppMsg::UserRelevantError(format!(
+					"Couldn't check for mods inside {path:?}: {e}"
+				)));
+				continue;
+			}
+			Ok(None) => break,
+			Ok(Some(entry)) => entry
 		};
 
-		let Ok(ft) = entry.file_type().inspect_err(|e| {
+		let Ok(ft) = entry.file_type().await.inspect_err(|e| {
 			_ = sender.send(AppMsg::UserRelevantError(format!(
 				"Couldn't detect filetype of {:?} (needed to determine if it's a mod file or not): {e}",
 				entry.path()
@@ -284,18 +289,17 @@ pub fn collect_mods_in_path(
 
 		let path = entry.path();
 		if ft.is_file() {
-			parse_if_path_is_manifest(path.into(), sender, id_accum);
+			parse_if_path_is_manifest(path.into(), sender, id_accum).await;
 		} else if ft.is_symlink() {
-			recurse_symlink(&path, sender, id_accum);
+			Box::pin(recurse_symlink(&path, sender, id_accum)).await;
 		} else if ft.is_dir() {
-			// do this last to maybe make tail-call recursion work?
-			collect_mods_in_path(&path, sender, id_accum);
+			Box::pin(collect_mods_in_path(&path, sender, id_accum)).await;
 		}
 	}
 }
 
-fn recurse_symlink(path: &Path, sender: &Sender<AppMsg>, id_accum: &mut BTreeSet<UniqueId>) {
-	let Ok(resolved) = std::fs::read_link(path).inspect_err(|e| {
+async fn recurse_symlink(path: &Path, sender: &Sender<AppMsg>, id_accum: &mut BTreeSet<UniqueId>) {
+	let Ok(resolved) = tokio::fs::read_link(path).await.inspect_err(|e| {
 		_ = sender.send(AppMsg::UserRelevantError(format!(
 			"Couldn't follow symlink at {path:?}: {e}"
 		)))
@@ -303,13 +307,13 @@ fn recurse_symlink(path: &Path, sender: &Sender<AppMsg>, id_accum: &mut BTreeSet
 		return;
 	};
 
-	match std::fs::metadata(&resolved) {
+	match tokio::fs::metadata(&resolved).await {
 		Err(e) => _ = sender.send(AppMsg::UserRelevantError(format!(
 			"Couldn't get metadata of file at {resolved:?} to check if it's a mod file: {e}"
 		))),
-		Ok(stat) if stat.is_file() => parse_if_path_is_manifest(resolved.into(), sender, id_accum),
-		Ok(stat) if stat.is_dir() => collect_mods_in_path(&path, sender, id_accum),
-		Ok(stat) if stat.is_symlink() => recurse_symlink(&resolved, sender, id_accum),
+		Ok(stat) if stat.is_file() => parse_if_path_is_manifest(resolved.into(), sender, id_accum).await,
+		Ok(stat) if stat.is_dir() => collect_mods_in_path(&path, sender, id_accum).await,
+		Ok(stat) if stat.is_symlink() => Box::pin(recurse_symlink(&resolved, sender, id_accum)).await,
 		// if it's not a file, directory, or symlink, then I have no idea how to handle it. Just
 		// send an error
 		Ok(stat) => _ = sender.send(AppMsg::UserRelevantError(format!(
@@ -318,7 +322,7 @@ fn recurse_symlink(path: &Path, sender: &Sender<AppMsg>, id_accum: &mut BTreeSet
 	}
 }
 
-fn parse_if_path_is_manifest(
+async fn parse_if_path_is_manifest(
 	path: Box<Path>,
 	sender: &Sender<AppMsg>,
 	id_accum: &mut BTreeSet<UniqueId>
@@ -327,7 +331,7 @@ fn parse_if_path_is_manifest(
 		return;
 	}
 
-	_ = match Mod::read_from(path) {
+	_ = match Mod::read_from(path).await {
 		Ok(m) => {
 			id_accum.insert(m.unique_id.clone());
 			sender.send(AppMsg::ModDiscovered(m))

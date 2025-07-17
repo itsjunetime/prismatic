@@ -66,8 +66,8 @@ impl Dirs {
 	}
 }
 
-pub fn get_modgroups_from_data_dir(modgroup_dir: &Path, sender: &Sender<AppMsg>) {
-	let Ok(dir) = std::fs::read_dir(modgroup_dir).inspect_err(|e| {
+pub async fn get_modgroups_from_data_dir(modgroup_dir: &Path, sender: &Sender<AppMsg>) {
+	let Ok(mut dir) = tokio::fs::read_dir(modgroup_dir).await.inspect_err(|e| {
 		sender
 			.send(AppMsg::UserRelevantError(format!(
 				"Couldn't read the list of modgroups in {modgroup_dir:?} due to: {e}"
@@ -77,16 +77,19 @@ pub fn get_modgroups_from_data_dir(modgroup_dir: &Path, sender: &Sender<AppMsg>)
 		return;
 	};
 
-	for entry in dir {
-		let Ok(entry) = entry
-			.inspect_err(|e| _ = sender.send(AppMsg::UserRelevantError(format!(
-				"Couldn't read a specific item or directory while looking for modgroups in in {modgroup_dir:?}: {e}"
-			))))
-		else {
-			continue
+	loop {
+		let entry = match dir.next_entry().await {
+			Err(e) => {
+				_ = sender.send(AppMsg::UserRelevantError(format!(
+					"Couldn't read a specific item or directory while looking for modgroups in in {modgroup_dir:?}: {e}"
+				)));
+				continue;
+			}
+			Ok(None) => break,
+			Ok(Some(e)) => e
 		};
 
-		let Ok(ft) = entry.file_type().inspect_err(|e| {
+		let Ok(ft) = entry.file_type().await.inspect_err(|e| {
 			_ = sender.send(AppMsg::UserRelevantError(format!(
 				"Couldn't check filetype of what should be a modgroup directory at {:?}: {e}",
 				entry.path()
@@ -107,7 +110,7 @@ pub fn get_modgroups_from_data_dir(modgroup_dir: &Path, sender: &Sender<AppMsg>)
 			};
 			let mut list_of_mods = BTreeSet::default();
 
-			collect_mods_in_path(&entry.path(), sender, &mut list_of_mods);
+			collect_mods_in_path(&entry.path(), sender, &mut list_of_mods).await;
 
 			let was_err = sender.send(AppMsg::ModGroupDiscovered(ModGroup {
 				name: modgroup_name.to_string(),

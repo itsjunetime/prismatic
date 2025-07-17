@@ -1,25 +1,32 @@
 use core::{error::Error, fmt::Display};
 use std::{
 	collections::{BTreeMap, BTreeSet},
-	ffi::OsString,
 	fs::read_link,
 	io::ErrorKind,
 	path::Path,
-	process::{Child, Command},
-	sync::mpsc::{self, Receiver, channel}
+	sync::{
+		PoisonError,
+		mpsc::{self, Receiver, channel}
+	}
 };
 
 use eframe::NativeOptions;
-use egui::{Align, Label, Layout, TextWrapMode, UiBuilder, Vec2, Vec2b, vec2};
+use egui::{Align, Label, Layout, UiBuilder, Vec2, Vec2b, vec2};
+use tokio::runtime::Runtime;
 
 use crate::{
+	config::{FileConfig, SmapiConfig},
 	dirs::{Dirs, get_modgroups_from_data_dir},
-	mod_group::{Mod, ModGroup, UniqueId, collect_mods_in_path}
+	fetch::{BrowserMessage, launch_browser},
+	mod_group::{Mod, ModGroup, UniqueId, collect_mods_in_path},
+	runner::RunningInstance
 };
 
+mod config;
 mod dirs;
 mod fetch;
 mod mod_group;
+mod runner;
 
 fn main() -> Result<(), Box<dyn Error>> {
 	let mut logger = None;
@@ -44,19 +51,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 const APP_NAME: &str = "prismatic";
 
 struct App {
+	runtime: Runtime,
 	dirs: crate::dirs::Dirs,
 	all_mods: BTreeMap<UniqueId, Mod>,
 	modgroups: BTreeSet<ModGroup>,
 	visible_errors: Vec<String>,
 	receiver: Receiver<AppMsg>,
-	current_run: Option<RunningInstance>,
+	current_run: Option<RunningDisplay>,
 	creating: Option<ModGroup>,
-	discovering_new_mods_from: Option<Receiver<AppMsg>>
+	discovering_new_mods_from: Option<Receiver<AppMsg>>,
+	config: FileConfig,
+	browser: Option<BrowserSession>
 }
 
-struct RunningInstance {
-	child: Child,
-	name: String
+struct RunningDisplay {
+	logs_displayed: bool,
+	instance: RunningInstance
+}
+
+pub struct BrowserSession {
+	task: tokio::task::JoinHandle<()>,
+	receiver: Receiver<BrowserMessage>
 }
 
 // It's fine to have large variants here 'cause these should only ever be present within a
@@ -74,6 +89,15 @@ enum AppMsg {
 impl Default for App {
 	fn default() -> Self {
 		let mut visible_errors = Vec::default();
+
+		let config = ::dirs::config_local_dir()
+			.and_then(|path| {
+				FileConfig::from_path(&path.join("prismatic.kdl"))
+					.inspect_err(|e| visible_errors.push(format!("Can't load config file: {e}")))
+					.ok()
+			})
+			.unwrap_or_default();
+
 		let dirs = crate::dirs::Dirs::default();
 
 		for dir in [&dirs.modgroups_dir, &dirs.mod_dir] {
@@ -90,19 +114,28 @@ impl Default for App {
 			}
 		}
 
+		let runtime = tokio::runtime::Runtime::new().expect(
+			"We couldn't initialize the tokio runtime. Nothing can work if we can't do this."
+		);
+
 		let (sender, receiver) = mpsc::channel();
 
 		let modgroups_sender = sender.clone();
 		let modgroups_dir = dirs.modgroups_dir.clone();
 
-		rayon::spawn(move || get_modgroups_from_data_dir(&modgroups_dir, &modgroups_sender));
+		runtime.spawn(async move {
+			get_modgroups_from_data_dir(&modgroups_dir, &modgroups_sender).await
+		});
 
 		let mods_sender = sender.clone();
 		let mods_dir = dirs.mod_dir.clone();
 		let mut id_accum = BTreeSet::default();
-		rayon::spawn(move || collect_mods_in_path(&mods_dir, &mods_sender, &mut id_accum));
+		runtime.spawn(
+			async move { collect_mods_in_path(&mods_dir, &mods_sender, &mut id_accum).await }
+		);
 
 		Self {
+			runtime,
 			dirs,
 			// this'll be populated as the rayon background stuff runs
 			all_mods: BTreeMap::default(),
@@ -112,16 +145,18 @@ impl Default for App {
 			receiver,
 			current_run: None,
 			creating: None,
-			discovering_new_mods_from: None
+			discovering_new_mods_from: None,
+			config,
+			browser: None
 		}
 	}
 }
 
 impl eframe::App for App {
 	fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-		if let Ok(msg) = self.receiver.try_recv() {
+		while let Ok(msg) = self.receiver.try_recv() {
 			self.handle_msg(msg);
-		};
+		}
 
 		self.check_if_discovered_new_mod();
 
@@ -195,6 +230,12 @@ impl eframe::App for App {
 				ui.horizontal(|ui| {
 					ui.heading("Prismatic");
 					ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+						/*ui.add_enabled_ui(self.browser.is_none(), |ui| {
+							if ui.button("Log In!").clicked() {
+								self.spawn_browser();
+							}
+						});*/
+
 						ui.add_enabled_ui(self.creating.is_none(), |ui| {
 							if ui.button("+ New ModGroup").clicked() {
 								self.creating = Some(ModGroup::default());
@@ -202,36 +243,95 @@ impl eframe::App for App {
 						});
 
 						if ui.button("+ Mod (from computer)").clicked() {
-							self.discovering_new_mods_from = start_discovering_new_mods_on_fs();
+							self.discovering_new_mods_from =
+								start_discovering_new_mods_on_fs(&self.runtime);
 						}
 					})
 				});
 
-				split_horiz(
-					ui,
-					ui.available_height(),
-					|ui| {
-						Self::modgroup_area(
-							ui,
-							&self.modgroups,
-							&mut self.current_run,
-							&mut self.visible_errors,
-							&self.dirs
-						)
-					},
-					|ui| {
-						ui.heading("Mods");
+				let mut new_run = None;
+				match &mut self.current_run {
+					Some(RunningDisplay {
+						logs_displayed: true,
+						instance
+					}) => {
+						ui.heading(format!("Currently running ModGroup '{}'", instance.name));
 
-						egui::ScrollArea::vertical().show(ui, |ui| {
-							for m in self.all_mods.values() {
-								ui.label(format!(
-									"{} by {}, version {}",
-									m.name, m.author, m.version
-								));
-							}
+						ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+							ui.horizontal(|ui| {
+								if ui.button("Restart").clicked() {
+									if let Err(e) = instance.child.kill() {
+										self.visible_errors.push(format!(
+											"Couldn't kill currently-running stardew: {e}"
+										));
+									};
+									new_run = match RunningInstance::try_new(
+										&instance.name,
+										&self.config.smapi_config,
+										self.dirs.stardew_paths.first().unwrap(),
+										&self.dirs.modgroups_dir
+									) {
+										Ok(instance) => Some(RunningDisplay {
+											logs_displayed: true,
+											instance
+										}),
+										Err(e) => {
+											self.visible_errors.push(format!(
+												"Couldn't start stardew back up again: {e}"
+											));
+											None
+										}
+									};
+								} else if ui.button("Stop Game").clicked()
+									&& let Err(e) = instance.child.kill()
+								{
+									self.visible_errors
+										.push(format!("Couldn't kill stardew: {e}"));
+								}
+							});
+
+							in_rect(
+								ui,
+								ui.available_size(),
+								Layout::top_down(Align::LEFT),
+								|ui| {
+									egui::ScrollArea::vertical().id_salt("logs_buf").show(
+										ui,
+										|ui| {
+											let borrowed_vec = instance
+												.logs_buf
+												.lock()
+												.unwrap_or_else(PoisonError::into_inner);
+											match str::from_utf8(&borrowed_vec) {
+												Ok(text) => ui.label(text),
+												Err(e) => ui.label(format!(
+													"SMAPI output contains non-unicode characters, so we can't display it: {e}"
+												))
+											};
+
+											match instance.child.try_wait() {
+												Err(e) =>
+													_ = ui.label(format!(
+														"We can't determine if the process has exited or not: {e}"
+													)),
+												Ok(Some(code)) =>
+													_ = ui.label(format!(
+														"Process exited with code {code}"
+													)),
+												Ok(None) => () // it's still running, continue
+											}
+										}
+									);
+								}
+							);
 						});
 					}
-				);
+					_ => self.mods_and_modgroup_area(ui)
+				}
+
+				if let Some(new_run) = new_run {
+					self.current_run = Some(new_run);
+				}
 
 				egui::ScrollArea::vertical()
 					.stick_to_bottom(true)
@@ -259,19 +359,52 @@ impl eframe::App for App {
 }
 
 impl App {
+	fn mods_and_modgroup_area(&mut self, ui: &mut egui::Ui) {
+		split_horiz(
+			ui,
+			ui.available_height(),
+			|ui| {
+				Self::modgroup_area(
+					ui,
+					&self.modgroups,
+					&mut self.current_run,
+					&mut self.visible_errors,
+					&self.dirs,
+					&self.config.smapi_config
+				)
+			},
+			|ui| {
+				ui.heading("Mods");
+
+				egui::ScrollArea::vertical().show(ui, |ui| {
+					for m in self.all_mods.values() {
+						ui.label(format!("{} by {}, version {}", m.name, m.author, m.version));
+					}
+				});
+			}
+		);
+	}
+
 	fn modgroup_area(
 		ui: &mut egui::Ui,
 		modgroups: &BTreeSet<ModGroup>,
-		current_run: &mut Option<RunningInstance>,
+		current_run: &mut Option<RunningDisplay>,
 		visible_errors: &mut Vec<String>,
-		dirs: &Dirs
+		dirs: &Dirs,
+		config: &SmapiConfig
 	) {
 		ui.heading("Mod Groups");
 		for group in modgroups {
-			let this_is_running = current_run.as_ref().is_some_and(|r| r.name == group.name);
+			let this_is_running = current_run
+				.as_ref()
+				.is_some_and(|r| r.instance.name == group.name);
 
 			if ui.button(&group.name).clicked() {
-				if let Some(instance) = current_run.as_mut() {
+				if let Some(RunningDisplay {
+					logs_displayed: _,
+					instance
+				}) = current_run.as_mut()
+				{
 					match instance.child.try_wait() {
 						Err(e) => visible_errors.push(format!(
 							"Couldn't check if currently-running instace of stardew (with pid {}) is actually still running: {e}. You should probably restart this app.",
@@ -286,20 +419,26 @@ impl App {
 				}
 
 				match &current_run {
-					None => match try_run_instance(
+					None => match RunningInstance::try_new(
 						&group.name,
+						config,
 						// TODO: Allow selecting
 						dirs.stardew_paths.iter().next().unwrap(),
 						&dirs.modgroups_dir
 					) {
-						Ok(child) =>
-							*current_run = Some(RunningInstance {
-								child,
-								name: group.name.clone()
-							}),
+						Ok(instance) => {
+							println!("got child with pid {}", instance.child.id());
+							*current_run = Some(RunningDisplay {
+								logs_displayed: true,
+								instance
+							});
+						}
 						Err(e) => panic!("{e}") // TODO: Handle
 					},
-					Some(instance) => {
+					Some(RunningDisplay {
+						logs_displayed: _,
+						instance
+					}) => {
 						let modal = egui_modal::Modal::new(ui.ctx(), "try_run_failed");
 						modal.show(|ui| {
 							modal.title(ui, "Stardew Already Running");
@@ -307,7 +446,10 @@ impl App {
 							modal.frame(ui, |ui| {
 								modal.body(
 									ui,
-									format!("Stardew is already running under modgroup {}, and we can't run it twice at the same time. \n\nPlease close the currently running instance and try again", instance.name)
+									format!(
+										"Stardew is already running under modgroup {}, and we can't run it twice at the same time. \n\nPlease close the currently running instance and try again",
+										instance.name
+									)
 								);
 							});
 
@@ -328,22 +470,38 @@ impl App {
 	}
 
 	fn handle_msg(&mut self, msg: AppMsg) {
+		Self::handle_msg_inner(
+			msg,
+			&mut self.visible_errors,
+			&mut self.all_mods,
+			&mut self.modgroups,
+			&self.dirs
+		);
+	}
+
+	fn handle_msg_inner(
+		msg: AppMsg,
+		visible_errors: &mut Vec<String>,
+		all_mods: &mut BTreeMap<UniqueId, Mod>,
+		modgroups: &mut BTreeSet<ModGroup>,
+		dirs: &dirs::Dirs
+	) {
 		match msg {
-			AppMsg::UserRelevantError(s) => self.visible_errors.push(s),
+			AppMsg::UserRelevantError(s) => visible_errors.push(s),
 			AppMsg::ModDiscovered(m) => {
 				// We don't care if there was already one in there - if modgroups have
 				// overlapping mods at all, we will be inserting the same mod multiple times,
 				// and that's fine. I don't think there's really any easy way to deduplicate
 				// work if we want to be fault-tolerant to someone messing with the directories
 				// we're storing these in.
-				_ = self.all_mods.insert(m.unique_id.clone(), m)
+				_ = all_mods.insert(m.unique_id.clone(), m)
 			}
 			AppMsg::ModGroupDiscovered(mod_group) => {
 				let name = mod_group.name.clone();
-				if !self.modgroups.insert(mod_group) {
-					self.visible_errors.push(format!(
+				if !modgroups.insert(mod_group) {
+					visible_errors.push(format!(
 						"Two mod groups with the name {name:?} detected; we can't handle multiple mod groups with the same name, so go clean up your modgroup directory (at {:?}) so no two top-level folders have the same name",
-						self.dirs.modgroups_dir
+						dirs.modgroups_dir
 					));
 				}
 			}
@@ -351,112 +509,68 @@ impl App {
 	}
 
 	fn check_if_discovered_new_mod(&mut self) {
-		if let Some(ref new_mod_recv) = self.discovering_new_mods_from
-			&& let Ok(mut msg) = new_mod_recv.try_recv()
-		{
-			if let AppMsg::ModDiscovered(ref mut new_mod) = msg {
-				let Some(parent_dir) = new_mod.manifest_path.parent() else {
-					self.visible_errors.push(format!(
-						"Can't process mod '{}' due to a malformed detected path ({:?}). This is a bug in Primsatic; please report it.",
-						new_mod.name,
-						new_mod.manifest_path
-					));
-					return;
-				};
+		if let Some(ref new_mod_recv) = self.discovering_new_mods_from {
+			while let Ok(mut msg) = new_mod_recv.try_recv() {
+				if let AppMsg::ModDiscovered(ref mut new_mod) = msg {
+					let Some(parent_dir) = new_mod.manifest_path.parent() else {
+						self.visible_errors.push(format!(
+							"Can't process mod '{}' due to a malformed detected path ({:?}). This is a bug in Primsatic; please report it.",
+							new_mod.name,
+							new_mod.manifest_path
+						));
+						return;
+					};
 
-				let new_mod_dir = self.dirs.mod_dir.join(&new_mod.unique_id.0);
-				if let Err(e) = std::fs::create_dir(&new_mod_dir) {
-					self.visible_errors.push(format!(
-						"Couldn't make new directory for mod '{}' at {:?}: {e}",
-						new_mod.name, new_mod_dir
-					));
-					return;
+					let new_mod_dir = self.dirs.mod_dir.join(&new_mod.unique_id.0);
+					if let Err(e) = std::fs::create_dir(&new_mod_dir) {
+						self.visible_errors.push(format!(
+							"Couldn't make new directory for mod '{}' at {:?}: {e}",
+							new_mod.name, new_mod_dir
+						));
+						return;
+					}
+
+					if let Err((err, io_err)) =
+						copy_contents_of_dir_into_new_dir(parent_dir, &new_mod_dir)
+					{
+						self.visible_errors.push(format!(
+							"Couldn't create new directory for mod: {err}: {io_err}"
+						));
+					}
 				}
 
-				if let Err((err, io_err)) =
-					copy_contents_of_dir_into_new_dir(parent_dir, &new_mod_dir)
-				{
-					self.visible_errors.push(format!(
-						"Couldn't create new directory for mod: {err}: {io_err}"
-					));
-				}
+				Self::handle_msg_inner(
+					msg,
+					&mut self.visible_errors,
+					&mut self.all_mods,
+					&mut self.modgroups,
+					&self.dirs
+				);
 			}
-
-			// TODO: Move new mod to correct place
-			self.handle_msg(msg);
 		}
 	}
-}
 
-#[derive(thiserror::Error, Debug)]
-enum TryRunError {
-	#[error("Couldn't setup mod group by linking {link_from:?} to {link_to:?}: {error}")]
-	FailedToSetupModGroup {
-		link_from: Box<Path>,
-		link_to: Box<Path>,
-		error: std::io::Error
-	},
-	#[error("Couldn't check if SMAPI is installed at {tried:?}: {error}")]
-	FailedToCheckIfSMAPIInstalled {
-		tried: Box<Path>,
-		error: std::io::Error
-	},
-	#[error("Couldn't find SMAPI, which we expected to be installed at {tried:?}")]
-	NoSMAPIInstalled { tried: Box<Path> },
-	#[error("Failed to run command {all_args:?}: {error}")]
-	CommandFailed {
-		all_args: Vec<OsString>,
-		error: std::io::Error
-	}
-}
+	fn spawn_browser(&mut self) {
+		match self.browser.take() {
+			// drop the receiver, we won't need it once we abort the task
+			Some(BrowserSession { task, receiver: _ }) => {
+				task.abort();
+			}
+			None => {
+				let (sender, receiver) = mpsc::channel();
 
-fn try_run_instance(
-	name: &str,
-	stardew_dir: &Path,
-	modgroup_dir: &Path
-) -> Result<Child, TryRunError> {
-	// if windows fails to setup symlink, we can run `start ms-settings:developers` with a regular
-	// user to allow it
-
-	const SDV_MODS_DIR_NAME: &str = "prismatic_mods";
-
-	let link_from = stardew_dir.join(SDV_MODS_DIR_NAME);
-
-	make_dir_symlink(modgroup_dir, &link_from).map_err(|error| {
-		TryRunError::FailedToSetupModGroup {
-			link_from: link_from.clone().into(),
-			link_to: modgroup_dir.into(),
-			error
+				let task = self.runtime.spawn(async move {
+					if let Err(e) = launch_browser(&sender).await {
+						println!("got err: {e}");
+						_ = sender.send(BrowserMessage::Error(format!(
+							"Couldn't launch browser: {e}"
+						)));
+					}
+				});
+				self.browser = Some(BrowserSession { task, receiver });
+			}
 		}
-	})?;
-
-	let smapi_path = stardew_dir.join("StardewModdingAPI");
-	match std::fs::exists(&smapi_path) {
-		Err(error) =>
-			return Err(TryRunError::FailedToCheckIfSMAPIInstalled {
-				tried: smapi_path.into(),
-				error
-			}),
-		Ok(true) => (),
-		Ok(false) =>
-			return Err(TryRunError::NoSMAPIInstalled {
-				tried: smapi_path.into()
-			}),
 	}
-
-	let mods_path = format!("{SDV_MODS_DIR_NAME}/{name}");
-	let mut cmd = Command::new(smapi_path);
-	cmd.args(["--use-current-shell", "--mods-path"])
-		.arg(&mods_path)
-		.env("SMAPI_MODS_PATH", mods_path);
-
-	let all_args = std::iter::once(cmd.get_program())
-		.chain(cmd.get_args())
-		.map(OsString::from)
-		.collect();
-
-	cmd.spawn()
-		.map_err(|error| TryRunError::CommandFailed { all_args, error })
 }
 
 fn make_dir_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
@@ -609,7 +723,7 @@ fn make_files_for_modgroup(
 	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(modgroup_path))
 }
 
-fn start_discovering_new_mods_on_fs() -> Option<Receiver<AppMsg>> {
+fn start_discovering_new_mods_on_fs(runtime: &Runtime) -> Option<Receiver<AppMsg>> {
 	let paths = rfd::FileDialog::new()
 		.set_can_create_directories(true)
 		.pick_folders()?;
@@ -620,7 +734,9 @@ fn start_discovering_new_mods_on_fs() -> Option<Receiver<AppMsg>> {
 	for path in paths {
 		let mut accum = BTreeSet::default();
 		let sender = sender.clone();
-		rayon::spawn(move || crate::mod_group::collect_mods_in_path(&path, &sender, &mut accum));
+		runtime.spawn(async move {
+			crate::mod_group::collect_mods_in_path(&path, &sender, &mut accum).await
+		});
 	}
 
 	Some(receiver)
