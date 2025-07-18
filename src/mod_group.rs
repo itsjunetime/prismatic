@@ -36,9 +36,9 @@ struct FileDependency {
 }
 
 #[derive(Debug)]
-struct Dependency {
-	unique_id: UniqueId,
-	is_required: bool
+pub struct Dependency {
+	pub unique_id: UniqueId,
+	pub is_required: bool
 }
 
 #[derive(Debug)]
@@ -51,7 +51,7 @@ pub struct Mod {
 	minimum_api_version: Option<MaybeSemver>,
 	update_keys: Vec<UpdateKey>,
 	content_pack_for: Option<ContentPack>,
-	dependencies: Vec<Dependency>,
+	pub dependencies: Vec<Dependency>,
 	pub manifest_path: Box<Path>
 }
 

@@ -58,10 +58,16 @@ struct App {
 	visible_errors: Vec<String>,
 	receiver: Receiver<AppMsg>,
 	current_run: Option<RunningDisplay>,
-	creating: Option<ModGroup>,
+	creating: Option<NewModGroup>,
 	discovering_new_mods_from: Option<Receiver<AppMsg>>,
 	config: FileConfig,
 	browser: Option<BrowserSession>
+}
+
+#[derive(Default)]
+struct NewModGroup {
+	wip: ModGroup,
+	dependents: BTreeMap<UniqueId, BTreeSet<UniqueId>>
 }
 
 struct RunningDisplay {
@@ -159,76 +165,23 @@ impl eframe::App for App {
 		}
 
 		self.check_if_discovered_new_mod();
-
-		if let Some(current) = &mut self.creating {
-			let modal = egui_modal::Modal::new(ctx, "new_modgroup_modal");
-
-			let mut create_button = None;
-			let mut cancel_button = None;
-			modal.show(|ui| {
-				modal.title(ui, "New ModGroup");
-
-				modal.frame(ui, |ui| {
-					ui.text_edit_singleline(&mut current.name);
-
-					ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-						egui::ScrollArea::vertical().show(ui, |ui| {
-							for (id, md) in &self.all_mods {
-								let contains = current.mods.contains(id);
-
-								// i essentially want to make an immutable bool here 'cause it's easier to
-								// follow the logic if we don't change `contains`.
-								if ui
-									.checkbox(
-										&mut { contains },
-										format!("{} ({})", md.name, md.version)
-									)
-									.clicked()
-								{
-									if contains {
-										current.mods.remove(id);
-									} else {
-										current.mods.insert(id.clone());
-									}
-								}
-							}
-						})
-					});
-
-					ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-						create_button = Some(modal.suggested_button(ui, "Create!"));
-
-						ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-							cancel_button = Some(modal.button(ui, "Cancel"));
-						});
-					});
-				});
-			});
-
-			modal.open();
-
-			if create_button.is_some_and(|b| b.clicked()) {
-				match make_files_for_modgroup(
-					&self.dirs.modgroups_dir,
-					&self.dirs.mod_dir,
-					self.creating.take().unwrap()
-				) {
-					Ok(group) => _ = self.modgroups.insert(group),
-					Err(ModGroupCreationErr { step, err }) => self
-						.visible_errors
-						.push(format!("Couldn't create modgroup: {step} ({err})",))
-				}
-			}
-
-			if cancel_button.is_some_and(|b| b.clicked()) {
-				self.creating = None;
-			}
-		}
+		self.new_modgroup_view(ctx);
 
 		egui::CentralPanel::default().show(ctx, |ui| {
 			ui.with_layout(Layout::top_down(Align::Min), |ui| {
 				ui.horizontal(|ui| {
 					ui.heading("Prismatic");
+
+					if let Some(RunningDisplay {
+						ref mut logs_displayed,
+						instance: _
+					}) = self.current_run
+						&& !*logs_displayed
+						&& ui.button("View Running Logs").clicked()
+					{
+						*logs_displayed = true;
+					}
+
 					ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
 						/*ui.add_enabled_ui(self.browser.is_none(), |ui| {
 							if ui.button("Log In!").clicked() {
@@ -238,7 +191,7 @@ impl eframe::App for App {
 
 						ui.add_enabled_ui(self.creating.is_none(), |ui| {
 							if ui.button("+ New ModGroup").clicked() {
-								self.creating = Some(ModGroup::default());
+								self.creating = Some(NewModGroup::default());
 							}
 						});
 
@@ -252,85 +205,25 @@ impl eframe::App for App {
 				let mut new_run = None;
 				match &mut self.current_run {
 					Some(RunningDisplay {
-						logs_displayed: true,
+						logs_displayed,
 						instance
-					}) => {
-						ui.heading(format!("Currently running ModGroup '{}'", instance.name));
-
-						ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-							ui.horizontal(|ui| {
-								if ui.button("Restart").clicked() {
-									if let Err(e) = instance.child.kill() {
-										self.visible_errors.push(format!(
-											"Couldn't kill currently-running stardew: {e}"
-										));
-									};
-									new_run = match RunningInstance::try_new(
-										&instance.name,
-										&self.config.smapi_config,
-										self.dirs.stardew_paths.first().unwrap(),
-										&self.dirs.modgroups_dir
-									) {
-										Ok(instance) => Some(RunningDisplay {
-											logs_displayed: true,
-											instance
-										}),
-										Err(e) => {
-											self.visible_errors.push(format!(
-												"Couldn't start stardew back up again: {e}"
-											));
-											None
-										}
-									};
-								} else if ui.button("Stop Game").clicked()
-									&& let Err(e) = instance.child.kill()
-								{
-									self.visible_errors
-										.push(format!("Couldn't kill stardew: {e}"));
-								}
-							});
-
-							in_rect(
-								ui,
-								ui.available_size(),
-								Layout::top_down(Align::LEFT),
-								|ui| {
-									egui::ScrollArea::vertical().id_salt("logs_buf").show(
-										ui,
-										|ui| {
-											let borrowed_vec = instance
-												.logs_buf
-												.lock()
-												.unwrap_or_else(PoisonError::into_inner);
-											match str::from_utf8(&borrowed_vec) {
-												Ok(text) => ui.label(text),
-												Err(e) => ui.label(format!(
-													"SMAPI output contains non-unicode characters, so we can't display it: {e}"
-												))
-											};
-
-											match instance.child.try_wait() {
-												Err(e) =>
-													_ = ui.label(format!(
-														"We can't determine if the process has exited or not: {e}"
-													)),
-												Ok(Some(code)) =>
-													_ = ui.label(format!(
-														"Process exited with code {code}"
-													)),
-												Ok(None) => () // it's still running, continue
-											}
-										}
-									);
-								}
-							);
-						});
-					}
+					}) if *logs_displayed => Self::logs_view(
+						ui,
+						logs_displayed,
+						instance,
+						&mut new_run,
+						&self.config.smapi_config,
+						&self.dirs,
+						&mut self.visible_errors
+					),
 					_ => self.mods_and_modgroup_area(ui)
 				}
 
-				if let Some(new_run) = new_run {
-					self.current_run = Some(new_run);
+				if let Some(instance) = new_run {
+					self.current_run = Some(RunningDisplay {
+						instance,
+						logs_displayed: true
+					});
 				}
 
 				egui::ScrollArea::vertical()
@@ -399,73 +292,75 @@ impl App {
 				.as_ref()
 				.is_some_and(|r| r.instance.name == group.name);
 
-			if ui.button(&group.name).clicked() {
-				if let Some(RunningDisplay {
-					logs_displayed: _,
-					instance
-				}) = current_run.as_mut()
-				{
-					match instance.child.try_wait() {
-						Err(e) => visible_errors.push(format!(
-							"Couldn't check if currently-running instace of stardew (with pid {}) is actually still running: {e}. You should probably restart this app.",
-							instance.child.id()
-						)),
-						Ok(None) => (), // It's still running, whatever.
-						// TODO: Show this status somehow?
-						//
-						// If it already exited, then just hide it. Nice and easy.
-						Ok(Some(_)) => *current_run = None,
-					}
-				}
-
-				match &current_run {
-					None => match RunningInstance::try_new(
-						&group.name,
-						config,
-						// TODO: Allow selecting
-						dirs.stardew_paths.iter().next().unwrap(),
-						&dirs.modgroups_dir
-					) {
-						Ok(instance) => {
-							println!("got child with pid {}", instance.child.id());
-							*current_run = Some(RunningDisplay {
-								logs_displayed: true,
-								instance
-							});
-						}
-						Err(e) => panic!("{e}") // TODO: Handle
-					},
-					Some(RunningDisplay {
+			ui.horizontal(|ui| {
+				if ui.button(&group.name).clicked() {
+					if let Some(RunningDisplay {
 						logs_displayed: _,
 						instance
-					}) => {
-						let modal = egui_modal::Modal::new(ui.ctx(), "try_run_failed");
-						modal.show(|ui| {
-							modal.title(ui, "Stardew Already Running");
+					}) = current_run.as_mut()
+					{
+						match instance.child.try_wait() {
+							Err(e) => visible_errors.push(format!(
+								"Couldn't check if currently-running instace of stardew (with pid {}) is actually still running: {e}. You should probably restart this app.",
+								instance.child.id()
+							)),
+							Ok(None) => (), // It's still running, whatever.
+							// TODO: Show this status somehow?
+							//
+							// If it already exited, then just hide it. Nice and easy.
+							Ok(Some(_)) => *current_run = None,
+						}
+					}
 
-							modal.frame(ui, |ui| {
-								modal.body(
-									ui,
-									format!(
-										"Stardew is already running under modgroup {}, and we can't run it twice at the same time. \n\nPlease close the currently running instance and try again",
-										instance.name
-									)
-								);
+					match &current_run {
+						None => match RunningInstance::try_new(
+							&group.name,
+							config,
+							// TODO: Allow selecting
+							dirs.stardew_paths.iter().next().unwrap(),
+							&dirs.modgroups_dir
+						) {
+							Ok(instance) => {
+								println!("got child with pid {}", instance.child.id());
+								*current_run = Some(RunningDisplay {
+									logs_displayed: true,
+									instance
+								});
+							}
+							Err(e) => panic!("{e}") // TODO: Handle
+						},
+						Some(RunningDisplay {
+							logs_displayed: _,
+							instance
+						}) => {
+							let modal = egui_modal::Modal::new(ui.ctx(), "try_run_failed");
+							modal.show(|ui| {
+								modal.title(ui, "Stardew Already Running");
+
+								modal.frame(ui, |ui| {
+									modal.body(
+										ui,
+										format!(
+											"Stardew is already running under modgroup {}, and we can't run it twice at the same time. \n\nPlease close the currently running instance and try again",
+											instance.name
+										)
+									);
+								});
+
+								// TODO: Allow user to click a button to kill it and then send the
+								// child to a separate thread to kill and show updates in the UI
+								modal.suggested_button(ui, "OK");
 							});
 
-							// TODO: Allow user to click a button to kill it and then send the
-							// child to a separate thread to kill and show updates in the UI
-							modal.suggested_button(ui, "OK");
-						});
-
-						modal.open();
+							modal.open();
+						}
 					}
 				}
-			}
 
-			if this_is_running {
-				ui.strong("(Running)");
-			}
+				if this_is_running {
+					ui.strong("(Running)");
+				}
+			});
 		}
 	}
 
@@ -550,6 +445,157 @@ impl App {
 		}
 	}
 
+	fn logs_view(
+		ui: &mut egui::Ui,
+		displayed: &mut bool,
+		instance: &mut RunningInstance,
+		new_run: &mut Option<RunningInstance>,
+		smapi_config: &SmapiConfig,
+		dirs: &Dirs,
+		visible_errors: &mut Vec<String>
+	) {
+		ui.horizontal(|ui| {
+			ui.heading(format!("Currently running ModGroup '{}'", instance.name));
+			if ui.button("Hide Logs").clicked() {
+				*displayed = false;
+			}
+		});
+
+		ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+			ui.horizontal(|ui| {
+				if ui.button("Restart").clicked() {
+					if let Err(e) = instance.child.kill() {
+						visible_errors
+							.push(format!("Couldn't kill currently-running stardew: {e}"));
+					};
+					*new_run = match RunningInstance::try_new(
+						&instance.name,
+						smapi_config,
+						dirs.stardew_paths.first().unwrap(),
+						&dirs.modgroups_dir
+					) {
+						Ok(instance) => Some(instance),
+						Err(e) => {
+							visible_errors
+								.push(format!("Couldn't start stardew back up again: {e}"));
+							None
+						}
+					};
+				} else if ui.button("Stop Game").clicked()
+					&& let Err(e) = instance.child.kill()
+				{
+					visible_errors.push(format!("Couldn't kill stardew: {e}"));
+				}
+			});
+
+			in_rect(
+				ui,
+				ui.available_size(),
+				Layout::top_down(Align::LEFT),
+				|ui| {
+					egui::ScrollArea::vertical()
+						.id_salt("logs_buf")
+						.show(ui, |ui| {
+							let borrowed_vec = instance
+								.logs_buf
+								.lock()
+								.unwrap_or_else(PoisonError::into_inner);
+
+							match str::from_utf8(&borrowed_vec) {
+								Ok(text) => ui.label(text),
+								Err(e) => ui.label(format!(
+									"SMAPI output contains non-unicode characters, so we can't display it: {e}"
+								))
+							};
+
+							match instance.child.try_wait() {
+								Err(e) =>
+									_ = ui.label(format!(
+										"We can't determine if the process has exited or not: {e}"
+									)),
+								Ok(Some(code)) =>
+									_ = ui.label(format!("Process exited with code {code}")),
+								Ok(None) => () // it's still running, continue
+							}
+						});
+				}
+			);
+		});
+	}
+
+	fn new_modgroup_view(&mut self, ctx: &egui::Context) {
+		if let Some(NewModGroup { wip, dependents }) = &mut self.creating {
+			let modal = egui_modal::Modal::new(ctx, "new_modgroup_modal");
+
+			let mut create_button = None;
+			let mut cancel_button = None;
+			modal.show(|ui| {
+				modal.title(ui, "New ModGroup");
+
+				modal.frame(ui, |ui| {
+					let window_height = ctx.available_rect().height();
+					let whole_area = vec2(
+						ui.available_width(),
+						ui.available_height().max((window_height * 0.8) - 40.)
+					);
+
+					in_rect(ui, whole_area, Layout::bottom_up(Align::LEFT), |ui| {
+						ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+							cancel_button = Some(modal.caution_button(ui, "Cancel"));
+
+							ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
+								create_button = Some(modal.suggested_button(ui, "Create!"));
+							});
+						});
+
+						in_rect(
+							ui,
+							ui.available_size(),
+							Layout::top_down(Align::LEFT),
+							|ui| {
+								ui.text_edit_singleline(&mut wip.name);
+
+								egui::ScrollArea::vertical().show(ui, |ui| {
+									for (id, md) in &self.all_mods {
+										list_mod(
+											ui,
+											id,
+											true,
+											Some(md),
+											&self.all_mods,
+											0,
+											dependents,
+											wip
+										);
+									}
+								});
+							}
+						);
+					});
+				});
+			});
+
+			modal.open();
+
+			if create_button.is_some_and(|b| b.clicked()) {
+				match make_files_for_modgroup(
+					&self.dirs.modgroups_dir,
+					&self.dirs.mod_dir,
+					self.creating.take().unwrap().wip
+				) {
+					Ok(group) => _ = self.modgroups.insert(group),
+					Err(ModGroupCreationErr { step, err }) => self
+						.visible_errors
+						.push(format!("Couldn't create modgroup: {step} ({err})",))
+				}
+			}
+
+			if cancel_button.is_some_and(|b| b.clicked()) {
+				self.creating = None;
+			}
+		}
+	}
+
 	fn spawn_browser(&mut self) {
 		match self.browser.take() {
 			// drop the receiver, we won't need it once we abort the task
@@ -569,6 +615,103 @@ impl App {
 				});
 				self.browser = Some(BrowserSession { task, receiver });
 			}
+		}
+	}
+}
+
+#[expect(clippy::too_many_arguments)]
+fn list_mod(
+	ui: &mut egui::Ui,
+	mod_id: &UniqueId,
+	required: bool,
+	already_found: Option<&Mod>,
+	all_mods: &BTreeMap<UniqueId, Mod>,
+	indent_level: u16,
+	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>,
+	wip: &mut ModGroup
+) {
+	let contains = wip.mods.contains(mod_id);
+	let selectable = dependents.get(mod_id).is_none_or(BTreeSet::is_empty) && indent_level == 0;
+	let found_mod = already_found.or_else(|| all_mods.get(mod_id));
+
+	if found_mod.is_none() && !required {
+		return;
+	}
+
+	ui.horizontal(|ui| {
+		ui.add_space(f32::from(indent_level) * 10.);
+		ui.add_enabled_ui(selectable, |ui| match found_mod {
+			Some(modd) =>
+				if ui
+					.checkbox(
+						&mut { contains },
+						format!("{} ({})", modd.name, modd.version)
+					)
+					.clicked()
+				{
+					if contains {
+						remove_mod_and_dependencies(modd, all_mods, wip, dependents);
+					} else {
+						add_mod_and_dependencies(modd, all_mods, wip, dependents);
+					}
+				},
+			None => _ = ui.label(format!("ERROR: Dependency with id {mod_id} not found"))
+		});
+	});
+
+	if let Some(found) = found_mod {
+		for dependency in &found.dependencies {
+			list_mod(
+				ui,
+				&dependency.unique_id,
+				dependency.is_required,
+				None,
+				all_mods,
+				indent_level + 1,
+				dependents,
+				wip
+			);
+		}
+	}
+}
+
+fn remove_mod_and_dependencies(
+	modd: &Mod,
+	all_mods: &BTreeMap<UniqueId, Mod>,
+	wip: &mut ModGroup,
+	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
+) {
+	wip.mods.remove(&modd.unique_id);
+	for set_of_dependents in dependents.values_mut() {
+		_ = set_of_dependents.remove(&modd.unique_id);
+	}
+
+	for dependency in &modd.dependencies {
+		if let Some(modd) = all_mods.get(&dependency.unique_id) {
+			remove_mod_and_dependencies(modd, all_mods, wip, dependents);
+		}
+	}
+}
+
+fn add_mod_and_dependencies(
+	modd: &Mod,
+	all_mods: &BTreeMap<UniqueId, Mod>,
+	wip: &mut ModGroup,
+	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
+) {
+	wip.mods.insert(modd.unique_id.clone());
+	for dependency in &modd.dependencies {
+		match dependents.get_mut(&dependency.unique_id) {
+			Some(deps) => _ = deps.insert(modd.unique_id.clone()),
+			None =>
+				_ = dependents.insert(
+					dependency.unique_id.clone(),
+					BTreeSet::from_iter([modd.unique_id.clone()])
+				),
+		}
+
+		if let Some(modd) = all_mods.get(&dependency.unique_id) {
+			add_mod_and_dependencies(modd, all_mods, wip, dependents);
 		}
 	}
 }
