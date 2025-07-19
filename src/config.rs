@@ -4,12 +4,25 @@ use std::path::Path;
 use kdl::{KdlDocument, KdlValue};
 
 // config options that you can set in the config file
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct FileConfig {
 	session_cookie: Option<String>,
 	api_key: Option<String>,
 	mod_detection: NewModDetectionConfig,
+	pub zoom_factor: f32,
 	pub smapi_config: SmapiConfig
+}
+
+impl Default for FileConfig {
+	fn default() -> Self {
+		Self {
+			session_cookie: None,
+			api_key: None,
+			mod_detection: NewModDetectionConfig::default(),
+			zoom_factor: 1.,
+			smapi_config: SmapiConfig::default()
+		}
+	}
 }
 
 #[derive(Default, Debug)]
@@ -57,6 +70,14 @@ impl FileConfig {
 			match node {
 				KdlValue::String(s) => wip.api_key = Some(s.to_string()),
 				_ => return Err(format!("`api_key` must be a string (got {node:?})"))
+			}
+		}
+
+		if let Some(node) = doc.get_arg("zoom_factor") {
+			match node {
+				KdlValue::Float(f) => wip.zoom_factor = *f as f32,
+				KdlValue::Integer(i) => wip.zoom_factor = *i as f32,
+				_ => return Err(format!("`scale_factor` must be a float (got {node:?})"))
 			}
 		}
 

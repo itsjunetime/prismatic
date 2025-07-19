@@ -67,6 +67,7 @@ struct App {
 #[derive(Default)]
 struct NewModGroup {
 	wip: ModGroup,
+	dependencies_expanded: BTreeSet<UniqueId>,
 	dependents: BTreeMap<UniqueId, BTreeSet<UniqueId>>
 }
 
@@ -163,6 +164,8 @@ impl eframe::App for App {
 		while let Ok(msg) = self.receiver.try_recv() {
 			self.handle_msg(msg);
 		}
+
+		ctx.set_zoom_factor(self.config.zoom_factor);
 
 		self.check_if_discovered_new_mod();
 		self.new_modgroup_view(ctx);
@@ -524,7 +527,7 @@ impl App {
 	}
 
 	fn new_modgroup_view(&mut self, ctx: &egui::Context) {
-		if let Some(NewModGroup { wip, dependents }) = &mut self.creating {
+		if let Some(new_group) = &mut self.creating {
 			let modal = egui_modal::Modal::new(ctx, "new_modgroup_modal");
 
 			let mut create_button = None;
@@ -553,7 +556,7 @@ impl App {
 							ui.available_size(),
 							Layout::top_down(Align::LEFT),
 							|ui| {
-								ui.text_edit_singleline(&mut wip.name);
+								ui.text_edit_singleline(&mut new_group.wip.name);
 
 								egui::ScrollArea::vertical().show(ui, |ui| {
 									for (id, md) in &self.all_mods {
@@ -564,8 +567,7 @@ impl App {
 											Some(md),
 											&self.all_mods,
 											0,
-											dependents,
-											wip
+											new_group
 										);
 									}
 								});
@@ -578,10 +580,16 @@ impl App {
 			modal.open();
 
 			if create_button.is_some_and(|b| b.clicked()) {
+				let mut creating = self.creating.take().unwrap();
+
+				for key in creating.dependents.into_keys() {
+					creating.wip.mods.insert(key);
+				}
+
 				match make_files_for_modgroup(
 					&self.dirs.modgroups_dir,
 					&self.dirs.mod_dir,
-					self.creating.take().unwrap().wip
+					creating.wip
 				) {
 					Ok(group) => _ = self.modgroups.insert(group),
 					Err(ModGroupCreationErr { step, err }) => self
@@ -619,7 +627,6 @@ impl App {
 	}
 }
 
-#[expect(clippy::too_many_arguments)]
 fn list_mod(
 	ui: &mut egui::Ui,
 	mod_id: &UniqueId,
@@ -627,39 +634,62 @@ fn list_mod(
 	already_found: Option<&Mod>,
 	all_mods: &BTreeMap<UniqueId, Mod>,
 	indent_level: u16,
-	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>,
-	wip: &mut ModGroup
+	new_group: &mut NewModGroup
 ) {
-	let contains = wip.mods.contains(mod_id);
-	let selectable = dependents.get(mod_id).is_none_or(BTreeSet::is_empty) && indent_level == 0;
+	let depended_upon = new_group
+		.dependents
+		.get(mod_id)
+		.is_some_and(|set| !set.is_empty());
+	let contains = new_group.wip.mods.contains(mod_id) || depended_upon;
+	let selectable = !depended_upon && indent_level == 0;
 	let found_mod = already_found.or_else(|| all_mods.get(mod_id));
 
 	if found_mod.is_none() && !required {
 		return;
 	}
 
+	let mut show_dependencies = false;
+	let has_deps_to_show = found_mod.is_some_and(|m| !m.dependencies.is_empty());
+
 	ui.horizontal(|ui| {
 		ui.add_space(f32::from(indent_level) * 10.);
 		ui.add_enabled_ui(selectable, |ui| match found_mod {
 			Some(modd) =>
-				if ui
-					.checkbox(
-						&mut { contains },
-						format!("{} ({})", modd.name, modd.version)
-					)
-					.clicked()
-				{
-					if contains {
-						remove_mod_and_dependencies(modd, all_mods, wip, dependents);
-					} else {
-						add_mod_and_dependencies(modd, all_mods, wip, dependents);
+				_ = ui.horizontal(|ui| {
+					if ui
+						.checkbox(
+							&mut { contains },
+							format!("{} ({})", modd.name, modd.version)
+						)
+						.clicked()
+					{
+						if contains {
+							new_group.wip.mods.remove(&modd.unique_id);
+							remove_mod_and_dependencies(modd, all_mods, &mut new_group.dependents);
+						} else {
+							new_group.wip.mods.insert(modd.unique_id.clone());
+							add_mod_and_dependencies(modd, all_mods, &mut new_group.dependents);
+						}
 					}
-				},
+
+					if indent_level == 0 && has_deps_to_show {
+						ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+							if new_group.dependencies_expanded.contains(mod_id) {
+								show_dependencies = true;
+								if ui.button("⏷").clicked() {
+									new_group.dependencies_expanded.remove(mod_id);
+								}
+							} else if ui.button("⏵").clicked() {
+								new_group.dependencies_expanded.insert(mod_id.clone());
+							}
+						});
+					}
+				}),
 			None => _ = ui.label(format!("ERROR: Dependency with id {mod_id} not found"))
 		});
 	});
 
-	if let Some(found) = found_mod {
+	if show_dependencies && let Some(found) = found_mod {
 		for dependency in &found.dependencies {
 			list_mod(
 				ui,
@@ -668,8 +698,7 @@ fn list_mod(
 				None,
 				all_mods,
 				indent_level + 1,
-				dependents,
-				wip
+				new_group
 			);
 		}
 	}
@@ -678,17 +707,15 @@ fn list_mod(
 fn remove_mod_and_dependencies(
 	modd: &Mod,
 	all_mods: &BTreeMap<UniqueId, Mod>,
-	wip: &mut ModGroup,
 	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
 ) {
-	wip.mods.remove(&modd.unique_id);
 	for set_of_dependents in dependents.values_mut() {
 		_ = set_of_dependents.remove(&modd.unique_id);
 	}
 
 	for dependency in &modd.dependencies {
 		if let Some(modd) = all_mods.get(&dependency.unique_id) {
-			remove_mod_and_dependencies(modd, all_mods, wip, dependents);
+			remove_mod_and_dependencies(modd, all_mods, dependents);
 		}
 	}
 }
@@ -696,10 +723,8 @@ fn remove_mod_and_dependencies(
 fn add_mod_and_dependencies(
 	modd: &Mod,
 	all_mods: &BTreeMap<UniqueId, Mod>,
-	wip: &mut ModGroup,
 	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
 ) {
-	wip.mods.insert(modd.unique_id.clone());
 	for dependency in &modd.dependencies {
 		match dependents.get_mut(&dependency.unique_id) {
 			Some(deps) => _ = deps.insert(modd.unique_id.clone()),
@@ -711,7 +736,7 @@ fn add_mod_and_dependencies(
 		}
 
 		if let Some(modd) = all_mods.get(&dependency.unique_id) {
-			add_mod_and_dependencies(modd, all_mods, wip, dependents);
+			add_mod_and_dependencies(modd, all_mods, dependents);
 		}
 	}
 }
