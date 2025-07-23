@@ -2,7 +2,7 @@ use std::{
 	ffi::OsString,
 	io::ErrorKind,
 	path::Path,
-	process::{Child, Command, Stdio},
+	process::{Child, Command},
 	sync::{Arc, Mutex, PoisonError},
 	thread::JoinHandle
 };
@@ -16,7 +16,7 @@ pub struct RunningInstance {
 	pub child: Child,
 	pub name: String,
 	pub logs_buf: Arc<Mutex<Vec<u8>>>,
-	log_consumer_thread: JoinHandle<()>
+	_log_consumer_thread: JoinHandle<()>
 }
 
 impl Drop for RunningInstance {
@@ -184,7 +184,7 @@ impl RunningInstance {
 			child,
 			name: name.to_string(),
 			logs_buf,
-			log_consumer_thread
+			_log_consumer_thread: log_consumer_thread
 		})
 	}
 }

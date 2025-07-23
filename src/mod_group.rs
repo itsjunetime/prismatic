@@ -1,7 +1,14 @@
-use core::{fmt::Display, str::FromStr};
-use std::{borrow::Cow, collections::BTreeSet, path::Path, sync::mpsc::Sender};
+use core::{borrow::Borrow, fmt::Display, str::FromStr};
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, BTreeSet},
+	path::Path,
+	sync::mpsc::Sender
+};
 
-use crate::{AppMsg, make_dir_symlink};
+use serde::Deserialize;
+
+use crate::{AppMsg, dirs::Dirs, make_dir_symlink};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -22,9 +29,9 @@ pub struct FileRepresentableMod {
 
 #[derive(serde::Deserialize, Debug)]
 #[serde(rename_all = "PascalCase")]
-struct ContentPack {
+pub struct ContentPack {
 	#[serde(rename = "UniqueID")]
-	unique_id: String
+	pub unique_id: String
 }
 
 #[derive(serde::Deserialize)]
@@ -50,7 +57,7 @@ pub struct Mod {
 	pub unique_id: UniqueId,
 	minimum_api_version: Option<MaybeSemver>,
 	update_keys: Vec<UpdateKey>,
-	content_pack_for: Option<ContentPack>,
+	pub content_pack_for: Option<ContentPack>,
 	pub dependencies: Vec<Dependency>,
 	pub manifest_path: Box<Path>
 }
@@ -142,14 +149,35 @@ impl Mod {
 			manifest_path
 		})
 	}
+
+	pub fn user_visible_name(&self, other_mods: &BTreeMap<UniqueId, Mod>) -> String {
+		let mut ret = format!("{} (v{}", self.name, self.version);
+
+		if let Some(pack_for) = &self.content_pack_for {
+			ret.push_str(", content pack for ");
+			match other_mods.get(&pack_for.unique_id) {
+				Some(modd) => ret.push_str(&modd.name),
+				None => ret.push_str(&pack_for.unique_id)
+			}
+		}
+
+		ret.push(')');
+		ret
+	}
 }
 
-#[derive(Clone, PartialEq, PartialOrd, Ord, Eq, Debug)]
+#[derive(Clone, PartialEq, PartialOrd, Ord, Eq, Debug, Deserialize)]
 pub struct UniqueId(pub String);
 
 impl Display for UniqueId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		self.0.fmt(f)
+	}
+}
+
+impl Borrow<String> for UniqueId {
+	fn borrow(&self) -> &String {
+		&self.0
 	}
 }
 
@@ -245,6 +273,10 @@ pub struct ModGroup {
 
 // TODO: Refactor to be non-recursive to avoid all the currently-necessary `Box::pins` (due to not
 // being able to natively represent recursive functions)
+//
+// TODO: Handle a situation where we may discover a mod before its dependency, and then all the
+// mods are present by the dependents graph is messed up (and then they may accidentally be allowed
+// to delete a mod that is actually required. maybe)
 pub async fn collect_mods_in_path(
 	path: &Path,
 	sender: &Sender<AppMsg>,
@@ -312,7 +344,7 @@ async fn recurse_symlink(path: &Path, sender: &Sender<AppMsg>, id_accum: &mut BT
 			"Couldn't get metadata of file at {resolved:?} to check if it's a mod file: {e}"
 		))),
 		Ok(stat) if stat.is_file() => parse_if_path_is_manifest(resolved.into(), sender, id_accum).await,
-		Ok(stat) if stat.is_dir() => collect_mods_in_path(&path, sender, id_accum).await,
+		Ok(stat) if stat.is_dir() => collect_mods_in_path(path, sender, id_accum).await,
 		Ok(stat) if stat.is_symlink() => Box::pin(recurse_symlink(&resolved, sender, id_accum)).await,
 		// if it's not a file, directory, or symlink, then I have no idea how to handle it. Just
 		// send an error
@@ -463,4 +495,23 @@ pub fn make_files_for_modgroup(
 	// if we fail when creating the other symlinks or whatever, make sure to clean up after
 	// ourselves.
 	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(modgroup_path))
+}
+
+pub fn delete_mod(
+	modd: &UniqueId,
+	dirs: &Dirs,
+	groups: &BTreeSet<ModGroup>
+) -> Result<(), std::io::Error> {
+	let mod_path = dirs.mod_dir.join(&modd.0);
+
+	std::fs::remove_dir_all(mod_path)?;
+
+	for group in groups.iter().filter(|g| g.mods.contains(modd)) {
+		let link = dirs.modgroups_dir.join(&group.name).join(&modd.0);
+
+		// docs says this removes a symlink if it exists, and that's what we want.
+		std::fs::remove_dir_all(&link)?;
+	}
+
+	Ok(())
 }

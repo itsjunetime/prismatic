@@ -19,7 +19,8 @@ use crate::{
 	dirs::{Dirs, get_modgroups_from_data_dir},
 	fetch::{BrowserMessage, launch_browser},
 	mod_group::{
-		Mod, ModGroup, ModGroupCreationErr, UniqueId, collect_mods_in_path, make_files_for_modgroup
+		Mod, ModGroup, ModGroupCreationErr, UniqueId, collect_mods_in_path, delete_mod,
+		make_files_for_modgroup
 	},
 	runner::RunningInstance
 };
@@ -87,12 +88,18 @@ struct AllMods {
 
 impl AllMods {
 	pub fn insert_mod(&mut self, modd: Mod) {
-		for d in &modd.dependencies {
-			match self.dependents.get_mut(&d.unique_id) {
+		let all_deps = modd
+			.dependencies
+			.iter()
+			.map(|d| &d.unique_id.0)
+			.chain(modd.content_pack_for.as_ref().map(|p| &p.unique_id));
+
+		for dependency_id in all_deps {
+			match self.dependents.get_mut(dependency_id) {
 				Some(dependents) => _ = dependents.insert(modd.unique_id.clone()),
 				None =>
 					_ = self.dependents.insert(
-						d.unique_id.clone(),
+						UniqueId(dependency_id.clone()),
 						BTreeSet::from_iter([modd.unique_id.clone()])
 					),
 			}
@@ -209,85 +216,81 @@ impl eframe::App for App {
 		self.new_modgroup_view(ctx);
 
 		egui::CentralPanel::default().show(ctx, |ui| {
-			ui.with_layout(Layout::top_down(Align::Min), |ui| {
-				ui.horizontal(|ui| {
-					ui.heading("Prismatic");
+			ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+				let mut remove_idx = None;
 
-					if let Some(RunningDisplay {
-						ref mut logs_displayed,
-						instance: _
-					}) = self.current_run
-						&& !*logs_displayed
-						&& ui.button("View Running Logs").clicked()
-					{
-						*logs_displayed = true;
+				for (idx, error) in self.visible_errors.iter().enumerate() {
+					ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+						if ui.button("❌").clicked() {
+							remove_idx = Some(idx);
+						}
+
+						ui.add(Label::new(error).wrap())
+					});
+				}
+
+				if let Some(idx) = remove_idx {
+					self.visible_errors.remove(idx);
+				}
+
+				ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+					ui.horizontal(|ui| {
+						ui.heading("Prismatic");
+
+						if let Some(RunningDisplay {
+							ref mut logs_displayed,
+							instance: _
+						}) = self.current_run && !*logs_displayed
+							&& ui.button("View Running Logs").clicked()
+						{
+							*logs_displayed = true;
+						}
+
+						ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+							/*ui.add_enabled_ui(self.browser.is_none(), |ui| {
+								if ui.button("Log In!").clicked() {
+									self.spawn_browser();
+								}
+							});*/
+
+							ui.add_enabled_ui(self.modal.is_none(), |ui| {
+								if ui.button("+ New ModGroup").clicked() {
+									self.modal =
+										Some(DisplayedModal::NewModGroup(NewModGroup::default()));
+								}
+							});
+
+							if ui.button("+ Mod (from computer)").clicked() {
+								self.discovering_new_mods_from =
+									start_discovering_new_mods_on_fs(&self.runtime);
+							}
+						})
+					});
+
+					let mut new_run = None;
+					match &mut self.current_run {
+						Some(RunningDisplay {
+							logs_displayed,
+							instance
+						}) if *logs_displayed => Self::logs_view(
+							ui,
+							logs_displayed,
+							instance,
+							&mut new_run,
+							&self.config.smapi_config,
+							&self.dirs,
+							&mut self.visible_errors
+						),
+						_ => self.mods_and_modgroup_area(ui)
 					}
 
-					ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-						/*ui.add_enabled_ui(self.browser.is_none(), |ui| {
-							if ui.button("Log In!").clicked() {
-								self.spawn_browser();
-							}
-						});*/
-
-						ui.add_enabled_ui(self.modal.is_none(), |ui| {
-							if ui.button("+ New ModGroup").clicked() {
-								self.modal =
-									Some(DisplayedModal::NewModGroup(NewModGroup::default()));
-							}
+					if let Some(instance) = new_run {
+						self.current_run = Some(RunningDisplay {
+							instance,
+							logs_displayed: true
 						});
-
-						if ui.button("+ Mod (from computer)").clicked() {
-							self.discovering_new_mods_from =
-								start_discovering_new_mods_on_fs(&self.runtime);
-						}
-					})
+					}
 				});
-
-				let mut new_run = None;
-				match &mut self.current_run {
-					Some(RunningDisplay {
-						logs_displayed,
-						instance
-					}) if *logs_displayed => Self::logs_view(
-						ui,
-						logs_displayed,
-						instance,
-						&mut new_run,
-						&self.config.smapi_config,
-						&self.dirs,
-						&mut self.visible_errors
-					),
-					_ => self.mods_and_modgroup_area(ui)
-				}
-
-				if let Some(instance) = new_run {
-					self.current_run = Some(RunningDisplay {
-						instance,
-						logs_displayed: true
-					});
-				}
-
-				egui::ScrollArea::vertical()
-					.stick_to_bottom(true)
-					.auto_shrink(Vec2b::TRUE)
-					.show(ui, |ui| {
-						let mut remove_idx = None;
-
-						for (idx, error) in self.visible_errors.iter().enumerate() {
-							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-								if ui.button("❌").clicked() {
-									remove_idx = Some(idx);
-								}
-
-								ui.add(Label::new(error).wrap())
-							});
-						}
-
-						if let Some(idx) = remove_idx {
-							self.visible_errors.remove(idx);
-						}
-					});
 			});
 		});
 	}
@@ -314,20 +317,38 @@ impl App {
 				egui::ScrollArea::vertical().show(ui, |ui| {
 					for m in self.all_mods.mods.values() {
 						ui.horizontal(|ui| {
-							ui.label(format!("{} by {}, version {}", m.name, m.author, m.version));
+							ui.label(m.user_visible_name(&self.all_mods.mods));
 
 							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-								ui.add_enabled_ui(
-									!self.all_mods.dependents.contains_key(&m.unique_id),
-									|ui| {
+								let dependents = self.all_mods.dependents.get(&m.unique_id);
+								let is_enabled = dependents.is_none_or(BTreeSet::is_empty);
+								let mut resp = ui
+									.add_enabled_ui(is_enabled, |ui| {
 										if ui.button("🗑").clicked() {
 											self.modal = Some(DisplayedModal::DeletingMod {
 												to_delete: m.unique_id.clone(),
 												also_delete: BTreeSet::default()
 											});
 										}
-									}
-								);
+									})
+									.response;
+
+								if let Some(deps) = dependents
+									&& !deps.is_empty()
+								{
+									let hover_text = format!(
+										"{} is required by {}",
+										m.name,
+										deps.iter()
+											.filter_map(|d| self.all_mods.mods.get(d))
+											.map(|m| m.user_visible_name(&self.all_mods.mods))
+											.collect::<Vec<_>>()
+											.join(", ")
+									);
+									resp = resp.on_disabled_hover_text(hover_text);
+								}
+
+								resp
 							});
 						});
 					}
@@ -546,38 +567,33 @@ impl App {
 				}
 			});
 
-			in_rect(
-				ui,
-				ui.available_size(),
-				Layout::top_down(Align::LEFT),
-				|ui| {
-					egui::ScrollArea::vertical()
-						.id_salt("logs_buf")
-						.show(ui, |ui| {
-							let borrowed_vec = instance
-								.logs_buf
-								.lock()
-								.unwrap_or_else(PoisonError::into_inner);
+			ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+				egui::ScrollArea::vertical()
+					.id_salt("logs_buf")
+					.show(ui, |ui| {
+						let borrowed_vec = instance
+							.logs_buf
+							.lock()
+							.unwrap_or_else(PoisonError::into_inner);
 
-							match str::from_utf8(&borrowed_vec) {
-								Ok(text) => ui.label(text),
-								Err(e) => ui.label(format!(
-									"SMAPI output contains non-unicode characters, so we can't display it: {e}"
-								))
-							};
+						match str::from_utf8(&borrowed_vec) {
+							Ok(text) => ui.label(text),
+							Err(e) => ui.label(format!(
+								"SMAPI output contains non-unicode characters, so we can't display it: {e}"
+							))
+						};
 
-							match instance.child.try_wait() {
-								Err(e) =>
-									_ = ui.label(format!(
-										"We can't determine if the process has exited or not: {e}"
-									)),
-								Ok(Some(code)) =>
-									_ = ui.label(format!("Process exited with code {code}")),
-								Ok(None) => () // it's still running, continue
-							}
-						});
-				}
-			);
+						match instance.child.try_wait() {
+							Err(e) =>
+								_ = ui.label(format!(
+									"We can't determine if the process has exited or not: {e}"
+								)),
+							Ok(Some(code)) =>
+								_ = ui.label(format!("Process exited with code {code}")),
+							Ok(None) => () // it's still running, continue
+						}
+					});
+			});
 		});
 	}
 
@@ -590,12 +606,14 @@ impl App {
 		let mut create_button = None;
 		let mut cancel_button = None;
 
-		let window_height = ctx.available_rect().height();
+		// let window_height = ctx.available_rect().height();
 		let whole_area = |ui: &egui::Ui| -> Vec2 {
-			vec2(
+			/*vec2(
 				ui.available_width(),
-				ui.available_height().max((window_height * 0.8) - 40.)
-			)
+				//ui.available_height().min(window_height * 0.8)
+				ui.available_height() * 0.8
+			)*/
+			ui.available_size()
 		};
 
 		match displayed {
@@ -604,7 +622,7 @@ impl App {
 					modal.title(ui, "New ModGroup");
 
 					modal.frame(ui, |ui| {
-						in_rect(ui, whole_area(ui), Layout::bottom_up(Align::LEFT), |ui| {
+						ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
 							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
 								cancel_button = Some(modal.caution_button(ui, "Cancel"));
 
@@ -613,28 +631,33 @@ impl App {
 								});
 							});
 
-							in_rect(
-								ui,
-								ui.available_size(),
-								Layout::top_down(Align::LEFT),
-								|ui| {
-									ui.text_edit_singleline(&mut new_group.wip.name);
+							ui.add_space(8.);
 
-									egui::ScrollArea::vertical().show(ui, |ui| {
-										for (id, md) in &self.all_mods.mods {
-											list_mod(
-												ui,
-												id,
-												true,
-												Some(md),
-												&self.all_mods.mods,
-												0,
-												new_group
-											);
-										}
+							ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+								ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+									ui.label("Name:");
+
+									ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+										ui.text_edit_singleline(&mut new_group.wip.name);
 									});
-								}
-							);
+								});
+
+								ui.add_space(8.);
+
+								egui::ScrollArea::vertical().show(ui, |ui| {
+									for (id, md) in &self.all_mods.mods {
+										list_mod(
+											ui,
+											id,
+											true,
+											Some(md),
+											&self.all_mods.mods,
+											0,
+											new_group
+										);
+									}
+								});
+							});
 						});
 					});
 				});
@@ -680,16 +703,33 @@ impl App {
 					modal.title(ui, format!("Delete {}?", modd.name));
 
 					modal.frame(ui, |ui| {
-						in_rect(ui, whole_area(ui), Layout::bottom_up(Align::LEFT), |ui| {
+						ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
 							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
 								cancel_button = Some(modal.caution_button(ui, "Cancel"));
 
-								ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+								ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
 									create_button = Some(modal.suggested_button(ui, "Delete!"));
 								});
 							});
 
-							in_rect(ui, ui.available_size(), Layout::top_down(Align::LEFT), |ui| {
+							ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+								let in_any_groups = self.modgroups.iter().any(|g| g.mods.contains(to_delete));
+								if in_any_groups {
+									ui.label("Warning: Deleting this mod will remove it from the following modgroups as well:");
+									for group in &self.modgroups {
+										if !group.mods.contains(to_delete) {
+											continue;
+										}
+
+										ui.horizontal(|ui| {
+											ui.add_space(10.);
+											ui.label(&group.name);
+										});
+									}
+
+									ui.add_space(20.);
+								}
+
 								if modd.dependencies.is_empty() {
 									ui.label("Are you sure you want to delete this mod?");
 								} else {
@@ -707,7 +747,19 @@ impl App {
 				modal.open();
 
 				if create_button.is_some_and(|b| b.clicked()) {
-					todo!()
+					let mut got_err = false;
+
+					for id in also_delete.iter().chain(std::iter::once(&*to_delete)) {
+						if let Err(e) = delete_mod(to_delete, &self.dirs, &self.modgroups) {
+							got_err = true;
+							self.visible_errors
+								.push(format!("Can't delete mod with id {id}: {e}"));
+						}
+					}
+
+					if !got_err {
+						self.modal = None;
+					}
 				}
 
 				if cancel_button.is_some_and(|b| b.clicked()) {
@@ -770,10 +822,7 @@ fn list_mod(
 			Some(modd) =>
 				_ = ui.horizontal(|ui| {
 					if ui
-						.checkbox(
-							&mut { contains },
-							format!("{} ({})", modd.name, modd.version)
-						)
+						.checkbox(&mut { contains }, modd.user_visible_name(all_mods))
 						.clicked()
 					{
 						if contains {
@@ -831,19 +880,28 @@ fn list_mod_as_dependent_to_delete(
 			.get(&dependency.unique_id)
 			.is_some_and(|d| !d.is_empty());
 
-		let installed = match (installed, has_dependents) {
-			(Some(i), true) => i,
-			_ => continue
+		let (Some(installed), true) = (installed, has_dependents) else {
+			continue;
 		};
 
 		let is_set_to_delete = also_delete.contains(&dependency.unique_id);
-		if ui.checkbox(&mut { is_set_to_delete }, &modd.name).clicked() {
-			if is_set_to_delete {
-				also_delete.remove(&dependency.unique_id);
-			} else {
-				also_delete.insert(dependency.unique_id.clone());
+		ui.horizontal_wrapped(|ui| {
+			ui.add_space(10. * f32::from(indent_level));
+
+			if ui
+				.checkbox(
+					&mut { is_set_to_delete },
+					installed.user_visible_name(&all_mods.mods)
+				)
+				.clicked()
+			{
+				if is_set_to_delete {
+					also_delete.remove(&dependency.unique_id);
+				} else {
+					also_delete.insert(dependency.unique_id.clone());
+				}
 			}
-		}
+		});
 
 		list_mod_as_dependent_to_delete(ui, indent_level + 1, installed, also_delete, all_mods);
 	}
