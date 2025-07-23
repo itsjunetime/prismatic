@@ -18,7 +18,9 @@ use crate::{
 	config::{FileConfig, SmapiConfig},
 	dirs::{Dirs, get_modgroups_from_data_dir},
 	fetch::{BrowserMessage, launch_browser},
-	mod_group::{Mod, ModGroup, UniqueId, collect_mods_in_path},
+	mod_group::{
+		Mod, ModGroup, ModGroupCreationErr, UniqueId, collect_mods_in_path, make_files_for_modgroup
+	},
 	runner::RunningInstance
 };
 
@@ -53,22 +55,58 @@ const APP_NAME: &str = "prismatic";
 struct App {
 	runtime: Runtime,
 	dirs: crate::dirs::Dirs,
-	all_mods: BTreeMap<UniqueId, Mod>,
+	all_mods: AllMods,
 	modgroups: BTreeSet<ModGroup>,
 	visible_errors: Vec<String>,
 	receiver: Receiver<AppMsg>,
 	current_run: Option<RunningDisplay>,
-	creating: Option<NewModGroup>,
+	modal: Option<DisplayedModal>,
 	discovering_new_mods_from: Option<Receiver<AppMsg>>,
 	config: FileConfig,
 	browser: Option<BrowserSession>
+}
+
+enum DisplayedModal {
+	NewModGroup(NewModGroup),
+	DeletingMod {
+		to_delete: UniqueId,
+		also_delete: BTreeSet<UniqueId>
+	}
+}
+
+// a map of a unique id to every single mod that depends on it. We don't track whether it is
+// depended on in a 'required' or 'optional' way because we only access it with mods that we
+// currently have on-system.
+pub type DependentsMap = BTreeMap<UniqueId, BTreeSet<UniqueId>>;
+
+#[derive(Default)]
+struct AllMods {
+	mods: BTreeMap<UniqueId, Mod>,
+	dependents: DependentsMap
+}
+
+impl AllMods {
+	pub fn insert_mod(&mut self, modd: Mod) {
+		for d in &modd.dependencies {
+			match self.dependents.get_mut(&d.unique_id) {
+				Some(dependents) => _ = dependents.insert(modd.unique_id.clone()),
+				None =>
+					_ = self.dependents.insert(
+						d.unique_id.clone(),
+						BTreeSet::from_iter([modd.unique_id.clone()])
+					),
+			}
+		}
+
+		self.mods.insert(modd.unique_id.clone(), modd);
+	}
 }
 
 #[derive(Default)]
 struct NewModGroup {
 	wip: ModGroup,
 	dependencies_expanded: BTreeSet<UniqueId>,
-	dependents: BTreeMap<UniqueId, BTreeSet<UniqueId>>
+	dependents: DependentsMap
 }
 
 struct RunningDisplay {
@@ -145,13 +183,13 @@ impl Default for App {
 			runtime,
 			dirs,
 			// this'll be populated as the rayon background stuff runs
-			all_mods: BTreeMap::default(),
+			all_mods: AllMods::default(),
 			// this'll also be populated as the rayon stuff runs
 			modgroups: BTreeSet::default(),
 			visible_errors,
 			receiver,
 			current_run: None,
-			creating: None,
+			modal: None,
 			discovering_new_mods_from: None,
 			config,
 			browser: None
@@ -192,9 +230,10 @@ impl eframe::App for App {
 							}
 						});*/
 
-						ui.add_enabled_ui(self.creating.is_none(), |ui| {
+						ui.add_enabled_ui(self.modal.is_none(), |ui| {
 							if ui.button("+ New ModGroup").clicked() {
-								self.creating = Some(NewModGroup::default());
+								self.modal =
+									Some(DisplayedModal::NewModGroup(NewModGroup::default()));
 							}
 						});
 
@@ -273,8 +312,24 @@ impl App {
 				ui.heading("Mods");
 
 				egui::ScrollArea::vertical().show(ui, |ui| {
-					for m in self.all_mods.values() {
-						ui.label(format!("{} by {}, version {}", m.name, m.author, m.version));
+					for m in self.all_mods.mods.values() {
+						ui.horizontal(|ui| {
+							ui.label(format!("{} by {}, version {}", m.name, m.author, m.version));
+
+							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+								ui.add_enabled_ui(
+									!self.all_mods.dependents.contains_key(&m.unique_id),
+									|ui| {
+										if ui.button("🗑").clicked() {
+											self.modal = Some(DisplayedModal::DeletingMod {
+												to_delete: m.unique_id.clone(),
+												also_delete: BTreeSet::default()
+											});
+										}
+									}
+								);
+							});
+						});
 					}
 				});
 			}
@@ -380,7 +435,7 @@ impl App {
 	fn handle_msg_inner(
 		msg: AppMsg,
 		visible_errors: &mut Vec<String>,
-		all_mods: &mut BTreeMap<UniqueId, Mod>,
+		all_mods: &mut AllMods,
 		modgroups: &mut BTreeSet<ModGroup>,
 		dirs: &dirs::Dirs
 	) {
@@ -392,7 +447,7 @@ impl App {
 				// and that's fine. I don't think there's really any easy way to deduplicate
 				// work if we want to be fault-tolerant to someone messing with the directories
 				// we're storing these in.
-				_ = all_mods.insert(m.unique_id.clone(), m)
+				all_mods.insert_mod(m);
 			}
 			AppMsg::ModGroupDiscovered(mod_group) => {
 				let name = mod_group.name.clone();
@@ -527,79 +582,137 @@ impl App {
 	}
 
 	fn new_modgroup_view(&mut self, ctx: &egui::Context) {
-		if let Some(new_group) = &mut self.creating {
-			let modal = egui_modal::Modal::new(ctx, "new_modgroup_modal");
+		let Some(displayed) = &mut self.modal else {
+			return;
+		};
 
-			let mut create_button = None;
-			let mut cancel_button = None;
-			modal.show(|ui| {
-				modal.title(ui, "New ModGroup");
+		let modal = egui_modal::Modal::new(ctx, "modal");
+		let mut create_button = None;
+		let mut cancel_button = None;
 
-				modal.frame(ui, |ui| {
-					let window_height = ctx.available_rect().height();
-					let whole_area = vec2(
-						ui.available_width(),
-						ui.available_height().max((window_height * 0.8) - 40.)
-					);
+		let window_height = ctx.available_rect().height();
+		let whole_area = |ui: &egui::Ui| -> Vec2 {
+			vec2(
+				ui.available_width(),
+				ui.available_height().max((window_height * 0.8) - 40.)
+			)
+		};
 
-					in_rect(ui, whole_area, Layout::bottom_up(Align::LEFT), |ui| {
-						ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-							cancel_button = Some(modal.caution_button(ui, "Cancel"));
+		match displayed {
+			DisplayedModal::NewModGroup(new_group) => {
+				modal.show(|ui| {
+					modal.title(ui, "New ModGroup");
 
-							ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-								create_button = Some(modal.suggested_button(ui, "Create!"));
-							});
-						});
+					modal.frame(ui, |ui| {
+						in_rect(ui, whole_area(ui), Layout::bottom_up(Align::LEFT), |ui| {
+							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+								cancel_button = Some(modal.caution_button(ui, "Cancel"));
 
-						in_rect(
-							ui,
-							ui.available_size(),
-							Layout::top_down(Align::LEFT),
-							|ui| {
-								ui.text_edit_singleline(&mut new_group.wip.name);
-
-								egui::ScrollArea::vertical().show(ui, |ui| {
-									for (id, md) in &self.all_mods {
-										list_mod(
-											ui,
-											id,
-											true,
-											Some(md),
-											&self.all_mods,
-											0,
-											new_group
-										);
-									}
+								ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
+									create_button = Some(modal.suggested_button(ui, "Create!"));
 								});
-							}
-						);
+							});
+
+							in_rect(
+								ui,
+								ui.available_size(),
+								Layout::top_down(Align::LEFT),
+								|ui| {
+									ui.text_edit_singleline(&mut new_group.wip.name);
+
+									egui::ScrollArea::vertical().show(ui, |ui| {
+										for (id, md) in &self.all_mods.mods {
+											list_mod(
+												ui,
+												id,
+												true,
+												Some(md),
+												&self.all_mods.mods,
+												0,
+												new_group
+											);
+										}
+									});
+								}
+							);
+						});
 					});
 				});
-			});
 
-			modal.open();
+				modal.open();
 
-			if create_button.is_some_and(|b| b.clicked()) {
-				let mut creating = self.creating.take().unwrap();
+				if create_button.is_some_and(|b| b.clicked()) {
+					let Some(DisplayedModal::NewModGroup(mut creating)) = self.modal.take() else {
+						unreachable!(
+							"This should only be clickable if we're already creating a new mod group"
+						);
+					};
 
-				for key in creating.dependents.into_keys() {
-					creating.wip.mods.insert(key);
+					for key in creating.dependents.into_keys() {
+						creating.wip.mods.insert(key);
+					}
+
+					match make_files_for_modgroup(
+						&self.dirs.modgroups_dir,
+						&self.dirs.mod_dir,
+						creating.wip
+					) {
+						Ok(group) => _ = self.modgroups.insert(group),
+						Err(ModGroupCreationErr { step, err }) => self
+							.visible_errors
+							.push(format!("Couldn't create modgroup: {step} ({err})",))
+					}
 				}
 
-				match make_files_for_modgroup(
-					&self.dirs.modgroups_dir,
-					&self.dirs.mod_dir,
-					creating.wip
-				) {
-					Ok(group) => _ = self.modgroups.insert(group),
-					Err(ModGroupCreationErr { step, err }) => self
-						.visible_errors
-						.push(format!("Couldn't create modgroup: {step} ({err})",))
+				if cancel_button.is_some_and(|b| b.clicked()) {
+					self.modal = None;
 				}
 			}
+			DisplayedModal::DeletingMod {
+				to_delete,
+				also_delete
+			} => {
+				let modd = self.all_mods.mods.get(to_delete).unwrap();
 
-			if cancel_button.is_some_and(|b| b.clicked()) {
-				self.creating = None;
+				// we're assuming you can only get to this point if it's actually ok to delete this
+				// mod (i.e. it's not required by anything else)
+				modal.show(|ui| {
+					modal.title(ui, format!("Delete {}?", modd.name));
+
+					modal.frame(ui, |ui| {
+						in_rect(ui, whole_area(ui), Layout::bottom_up(Align::LEFT), |ui| {
+							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+								cancel_button = Some(modal.caution_button(ui, "Cancel"));
+
+								ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+									create_button = Some(modal.suggested_button(ui, "Delete!"));
+								});
+							});
+
+							in_rect(ui, ui.available_size(), Layout::top_down(Align::LEFT), |ui| {
+								if modd.dependencies.is_empty() {
+									ui.label("Are you sure you want to delete this mod?");
+								} else {
+									ui.label(format!("This mod requires some other mods that you won't need to keep around anymore once this mod is gone. Select which ones you also want to delete along with {}", modd.name));
+
+									egui::ScrollArea::vertical().show(ui, |ui| {
+										list_mod_as_dependent_to_delete(ui, 0, modd, also_delete, &self.all_mods);
+									});
+								}
+							});
+						});
+					});
+				});
+
+				modal.open();
+
+				if create_button.is_some_and(|b| b.clicked()) {
+					todo!()
+				}
+
+				if cancel_button.is_some_and(|b| b.clicked()) {
+					self.modal = None;
+				}
 			}
 		}
 	}
@@ -704,6 +817,38 @@ fn list_mod(
 	}
 }
 
+fn list_mod_as_dependent_to_delete(
+	ui: &mut egui::Ui,
+	indent_level: u16,
+	modd: &Mod,
+	also_delete: &mut BTreeSet<UniqueId>,
+	all_mods: &AllMods
+) {
+	for dependency in &modd.dependencies {
+		let installed = all_mods.mods.get(&dependency.unique_id);
+		let has_dependents = all_mods
+			.dependents
+			.get(&dependency.unique_id)
+			.is_some_and(|d| !d.is_empty());
+
+		let installed = match (installed, has_dependents) {
+			(Some(i), true) => i,
+			_ => continue
+		};
+
+		let is_set_to_delete = also_delete.contains(&dependency.unique_id);
+		if ui.checkbox(&mut { is_set_to_delete }, &modd.name).clicked() {
+			if is_set_to_delete {
+				also_delete.remove(&dependency.unique_id);
+			} else {
+				also_delete.insert(dependency.unique_id.clone());
+			}
+		}
+
+		list_mod_as_dependent_to_delete(ui, indent_level + 1, installed, also_delete, all_mods);
+	}
+}
+
 fn remove_mod_and_dependencies(
 	modd: &Mod,
 	all_mods: &BTreeMap<UniqueId, Mod>,
@@ -766,129 +911,6 @@ fn make_dir_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
 	{
 		std::os::windows::fs::symlink_dir(original, link)
 	}
-}
-
-enum FailedCreation {
-	ModGroupFolderCreation(Box<Path>),
-	CantCheckIfModExists {
-		mod_id: UniqueId,
-		expected_at: Box<Path>
-	},
-	NoSuchMod {
-		mod_id: UniqueId,
-		expected_at: Box<Path>
-	},
-	ModSymlink {
-		mod_id: UniqueId,
-		found_at: Box<Path>,
-		link_to: Box<Path>
-	}
-}
-
-impl Display for FailedCreation {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::ModGroupFolderCreation(path) =>
-				write!(f, "couldn't create main folder for modgroup at {path:?}"),
-			Self::CantCheckIfModExists {
-				mod_id,
-				expected_at
-			} => write!(
-				f,
-				"couldn't check if mod with id {mod_id} actually exists (we expect it at {expected_at:?})"
-			),
-			Self::NoSuchMod {
-				mod_id,
-				expected_at
-			} => write!(
-				f,
-				"selected mod '{mod_id}' doesn't actually seem to exist (expected to see it at {expected_at:?} - did you delete it from the filesystem?"
-			),
-			Self::ModSymlink {
-				mod_id,
-				found_at,
-				link_to
-			} => write!(
-				f,
-				"couldn't make symlink from {found_at:?} to {link_to:?} to associate mod {mod_id} with this modgroup"
-			)
-		}
-	}
-}
-
-struct ModGroupCreationErr {
-	step: FailedCreation,
-	err: std::io::Error
-}
-
-fn make_files_for_modgroup(
-	modgroup_dir: &Path,
-	mod_dir: &Path,
-	group: ModGroup
-) -> Result<ModGroup, ModGroupCreationErr> {
-	let ModGroup { name, mods } = group;
-
-	let modgroup_path = modgroup_dir.join(&name);
-
-	if let Err(err) = std::fs::create_dir(&modgroup_path) {
-		return Err(ModGroupCreationErr {
-			step: FailedCreation::ModGroupFolderCreation(modgroup_path.into()),
-			err
-		});
-	}
-
-	let do_the_rest = || {
-		let mods = mods
-			.into_iter()
-			.map(|id| {
-				let real_dir = mod_dir.join(&id.0);
-
-				match std::fs::exists(&real_dir) {
-					Err(e) =>
-						return Err(ModGroupCreationErr {
-							step: FailedCreation::CantCheckIfModExists {
-								mod_id: id,
-								expected_at: real_dir.into()
-							},
-							err: e
-						}),
-					Ok(false) =>
-						return Err(ModGroupCreationErr {
-							step: FailedCreation::NoSuchMod {
-								mod_id: id,
-								expected_at: real_dir.into()
-							},
-							err: std::io::Error::new(
-								std::io::ErrorKind::NotFound,
-								"No such mod folder exists"
-							)
-						}),
-					// if it exists, all is good
-					Ok(true) => ()
-				}
-
-				let link = modgroup_path.join(&id.0);
-				match make_dir_symlink(&real_dir, &link) {
-					Err(err) => Err(ModGroupCreationErr {
-						step: FailedCreation::ModSymlink {
-							mod_id: id,
-							found_at: real_dir.into(),
-							link_to: link.into()
-						},
-						// TODO: Should we also include `real_dir` into this path somehow?
-						err
-					}),
-					Ok(()) => Ok(id)
-				}
-			})
-			.collect::<Result<BTreeSet<_>, _>>()?;
-
-		Ok(ModGroup { mods, name })
-	};
-
-	// if we fail when creating the other symlinks or whatever, make sure to clean up after
-	// ourselves.
-	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(modgroup_path))
 }
 
 fn start_discovering_new_mods_on_fs(runtime: &Runtime) -> Option<Receiver<AppMsg>> {

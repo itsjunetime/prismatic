@@ -1,7 +1,7 @@
 use core::{fmt::Display, str::FromStr};
 use std::{borrow::Cow, collections::BTreeSet, path::Path, sync::mpsc::Sender};
 
-use crate::AppMsg;
+use crate::{AppMsg, make_dir_symlink};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -340,4 +340,127 @@ async fn parse_if_path_is_manifest(
 			"Couldn't read mod at {path:?}: {e}"
 		)))
 	};
+}
+
+pub enum FailedCreation {
+	ModGroupFolderCreation(Box<Path>),
+	CantCheckIfModExists {
+		mod_id: UniqueId,
+		expected_at: Box<Path>
+	},
+	NoSuchMod {
+		mod_id: UniqueId,
+		expected_at: Box<Path>
+	},
+	ModSymlink {
+		mod_id: UniqueId,
+		found_at: Box<Path>,
+		link_to: Box<Path>
+	}
+}
+
+impl Display for FailedCreation {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::ModGroupFolderCreation(path) =>
+				write!(f, "couldn't create main folder for modgroup at {path:?}"),
+			Self::CantCheckIfModExists {
+				mod_id,
+				expected_at
+			} => write!(
+				f,
+				"couldn't check if mod with id {mod_id} actually exists (we expect it at {expected_at:?})"
+			),
+			Self::NoSuchMod {
+				mod_id,
+				expected_at
+			} => write!(
+				f,
+				"selected mod '{mod_id}' doesn't actually seem to exist (expected to see it at {expected_at:?} - did you delete it from the filesystem?"
+			),
+			Self::ModSymlink {
+				mod_id,
+				found_at,
+				link_to
+			} => write!(
+				f,
+				"couldn't make symlink from {found_at:?} to {link_to:?} to associate mod {mod_id} with this modgroup"
+			)
+		}
+	}
+}
+
+pub struct ModGroupCreationErr {
+	pub step: FailedCreation,
+	pub err: std::io::Error
+}
+
+pub fn make_files_for_modgroup(
+	modgroup_dir: &Path,
+	mod_dir: &Path,
+	group: ModGroup
+) -> Result<ModGroup, ModGroupCreationErr> {
+	let ModGroup { name, mods } = group;
+
+	let modgroup_path = modgroup_dir.join(&name);
+
+	if let Err(err) = std::fs::create_dir(&modgroup_path) {
+		return Err(ModGroupCreationErr {
+			step: FailedCreation::ModGroupFolderCreation(modgroup_path.into()),
+			err
+		});
+	}
+
+	let do_the_rest = || {
+		let mods = mods
+			.into_iter()
+			.map(|id| {
+				let real_dir = mod_dir.join(&id.0);
+
+				match std::fs::exists(&real_dir) {
+					Err(e) =>
+						return Err(ModGroupCreationErr {
+							step: FailedCreation::CantCheckIfModExists {
+								mod_id: id,
+								expected_at: real_dir.into()
+							},
+							err: e
+						}),
+					Ok(false) =>
+						return Err(ModGroupCreationErr {
+							step: FailedCreation::NoSuchMod {
+								mod_id: id,
+								expected_at: real_dir.into()
+							},
+							err: std::io::Error::new(
+								std::io::ErrorKind::NotFound,
+								"No such mod folder exists"
+							)
+						}),
+					// if it exists, all is good
+					Ok(true) => ()
+				}
+
+				let link = modgroup_path.join(&id.0);
+				match make_dir_symlink(&real_dir, &link) {
+					Err(err) => Err(ModGroupCreationErr {
+						step: FailedCreation::ModSymlink {
+							mod_id: id,
+							found_at: real_dir.into(),
+							link_to: link.into()
+						},
+						// TODO: Should we also include `real_dir` into this path somehow?
+						err
+					}),
+					Ok(()) => Ok(id)
+				}
+			})
+			.collect::<Result<BTreeSet<_>, _>>()?;
+
+		Ok(ModGroup { mods, name })
+	};
+
+	// if we fail when creating the other symlinks or whatever, make sure to clean up after
+	// ourselves.
+	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(modgroup_path))
 }
