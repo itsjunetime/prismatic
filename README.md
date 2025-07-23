@@ -6,11 +6,11 @@ A ***VERY*** work-in-progress Mod manager for Stardew Valley.
 - [x] Detect mods currently on computer
 - [x] Create modgroups as a group of mods
 - [x] Run a modgroup using SMAPI
+- [x] Automatic dependency detection and management within groups
+- [x] Customization of Stardew args/wrapper
 
 ## TODOs
 - [ ] Download mods from NexusMods
-- [ ] Automatic dependency detection and management within groups
-- [ ] Customization of Stardew args/wrapper
 - [ ] Updating/Downgrading of Mods
 - [ ] Selection of which installed version of Stardew to run (e.g. Steam vs GOG vs wherever else)
 - [ ] Nice-to-look-at UI
