@@ -3,10 +3,8 @@ use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet},
 	path::Path,
-	sync::mpsc::Sender
+	sync::{Arc, mpsc::Sender}
 };
-
-use serde::Deserialize;
 
 use crate::{AppMsg, dirs::Dirs, make_dir_symlink};
 
@@ -53,9 +51,9 @@ pub struct Mod {
 	pub name: String,
 	pub author: String,
 	pub version: MaybeSemver,
-	description: String,
+	pub description: String,
 	pub unique_id: UniqueId,
-	minimum_api_version: Option<MaybeSemver>,
+	pub minimum_api_version: Option<MaybeSemver>,
 	update_keys: Vec<UpdateKey>,
 	pub content_pack_for: Option<ContentPack>,
 	pub dependencies: Vec<Dependency>,
@@ -130,18 +128,15 @@ impl Mod {
 			author,
 			version: MaybeSemver::from(version),
 			description,
-			unique_id: UniqueId(unique_id),
+			unique_id: UniqueId(Arc::from(unique_id)),
 			minimum_api_version: minimum_api_version.map(MaybeSemver::from),
 			update_keys: update_keys_parsed,
 			content_pack_for,
+			#[rustfmt::skip]
 			dependencies: dependencies
 				.into_iter()
-				.map(
-					|FileDependency {
-					     unique_id,
-					     is_required
-					 }| Dependency {
-						unique_id: UniqueId(unique_id),
+				.map(|FileDependency { unique_id, is_required }| Dependency {
+						unique_id: UniqueId(Arc::from(unique_id)),
 						is_required: is_required.unwrap_or(true)
 					}
 				)
@@ -155,7 +150,7 @@ impl Mod {
 
 		if let Some(pack_for) = &self.content_pack_for {
 			ret.push_str(", content pack for ");
-			match other_mods.get(&pack_for.unique_id) {
+			match other_mods.get(pack_for.unique_id.as_str()) {
 				Some(modd) => ret.push_str(&modd.name),
 				None => ret.push_str(&pack_for.unique_id)
 			}
@@ -166,8 +161,8 @@ impl Mod {
 	}
 }
 
-#[derive(Clone, PartialEq, PartialOrd, Ord, Eq, Debug, Deserialize)]
-pub struct UniqueId(pub String);
+#[derive(Clone, PartialEq, PartialOrd, Ord, Eq, Debug)]
+pub struct UniqueId(pub Arc<str>);
 
 impl Display for UniqueId {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,9 +170,21 @@ impl Display for UniqueId {
 	}
 }
 
-impl Borrow<String> for UniqueId {
-	fn borrow(&self) -> &String {
+impl Borrow<str> for UniqueId {
+	fn borrow(&self) -> &str {
 		&self.0
+	}
+}
+
+impl From<&str> for UniqueId {
+	fn from(value: &str) -> Self {
+		Self(Arc::from(value))
+	}
+}
+
+impl From<&UniqueId> for UniqueId {
+	fn from(value: &UniqueId) -> Self {
+		value.clone()
 	}
 }
 
@@ -447,7 +454,7 @@ pub fn make_files_for_modgroup(
 		let mods = mods
 			.into_iter()
 			.map(|id| {
-				let real_dir = mod_dir.join(&id.0);
+				let real_dir = mod_dir.join(&*id.0);
 
 				match std::fs::exists(&real_dir) {
 					Err(e) =>
@@ -473,7 +480,7 @@ pub fn make_files_for_modgroup(
 					Ok(true) => ()
 				}
 
-				let link = modgroup_path.join(&id.0);
+				let link = modgroup_path.join(&*id.0);
 				match make_dir_symlink(&real_dir, &link) {
 					Err(err) => Err(ModGroupCreationErr {
 						step: FailedCreation::ModSymlink {
@@ -481,7 +488,6 @@ pub fn make_files_for_modgroup(
 							found_at: real_dir.into(),
 							link_to: link.into()
 						},
-						// TODO: Should we also include `real_dir` into this path somehow?
 						err
 					}),
 					Ok(()) => Ok(id)
@@ -502,12 +508,12 @@ pub fn delete_mod(
 	dirs: &Dirs,
 	groups: &BTreeSet<ModGroup>
 ) -> Result<(), std::io::Error> {
-	let mod_path = dirs.mod_dir.join(&modd.0);
+	let mod_path = dirs.mod_dir.join(&*modd.0);
 
 	std::fs::remove_dir_all(mod_path)?;
 
 	for group in groups.iter().filter(|g| g.mods.contains(modd)) {
-		let link = dirs.modgroups_dir.join(&group.name).join(&modd.0);
+		let link = dirs.modgroups_dir.join(&group.name).join(&*modd.0);
 
 		// docs says this removes a symlink if it exists, and that's what we want.
 		std::fs::remove_dir_all(&link)?;

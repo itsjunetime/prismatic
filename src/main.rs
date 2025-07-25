@@ -1,4 +1,4 @@
-use core::{error::Error, fmt::Display};
+use core::{borrow::Borrow, error::Error, fmt::Display};
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	fs::read_link,
@@ -11,7 +11,10 @@ use std::{
 };
 
 use eframe::NativeOptions;
-use egui::{Align, Label, Layout, UiBuilder, Vec2, Vec2b, vec2};
+use egui::{
+	Align, Color32, CornerRadius, Label, Layout, Sense, Shape, Stroke, UiBuilder, Vec2,
+	epaint::RectShape, vec2
+};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -57,6 +60,7 @@ struct App {
 	runtime: Runtime,
 	dirs: crate::dirs::Dirs,
 	all_mods: AllMods,
+	expanded_mods: BTreeSet<UniqueId>,
 	modgroups: BTreeSet<ModGroup>,
 	visible_errors: Vec<String>,
 	receiver: Receiver<AppMsg>,
@@ -88,21 +92,30 @@ struct AllMods {
 
 impl AllMods {
 	pub fn insert_mod(&mut self, modd: Mod) {
-		let all_deps = modd
-			.dependencies
-			.iter()
-			.map(|d| &d.unique_id.0)
-			.chain(modd.content_pack_for.as_ref().map(|p| &p.unique_id));
-
-		for dependency_id in all_deps {
-			match self.dependents.get_mut(dependency_id) {
-				Some(dependents) => _ = dependents.insert(modd.unique_id.clone()),
-				None =>
-					_ = self.dependents.insert(
-						UniqueId(dependency_id.clone()),
-						BTreeSet::from_iter([modd.unique_id.clone()])
-					),
+		pub fn insert_dep<'a, D>(
+			dep_id: &'a D,
+			mod_id: &UniqueId,
+			dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
+		) where
+			D: Ord + ?Sized,
+			UniqueId: Borrow<D> + From<&'a D>
+		{
+			match dependents.get_mut(dep_id) {
+				Some(dependents) => _ = dependents.insert(mod_id.clone()),
+				None => _ = dependents.insert(dep_id.into(), BTreeSet::from_iter([mod_id.clone()]))
 			}
+		}
+
+		for dep_id in &modd.dependencies {
+			insert_dep(&dep_id.unique_id, &modd.unique_id, &mut self.dependents);
+		}
+
+		if let Some(pack_for) = &modd.content_pack_for {
+			insert_dep(
+				pack_for.unique_id.as_str(),
+				&modd.unique_id,
+				&mut self.dependents
+			);
 		}
 
 		self.mods.insert(modd.unique_id.clone(), modd);
@@ -193,6 +206,7 @@ impl Default for App {
 			all_mods: AllMods::default(),
 			// this'll also be populated as the rayon stuff runs
 			modgroups: BTreeSet::default(),
+			expanded_mods: BTreeSet::default(),
 			visible_errors,
 			receiver,
 			current_run: None,
@@ -272,15 +286,22 @@ impl eframe::App for App {
 						Some(RunningDisplay {
 							logs_displayed,
 							instance
-						}) if *logs_displayed => Self::logs_view(
-							ui,
-							logs_displayed,
-							instance,
-							&mut new_run,
-							&self.config.smapi_config,
-							&self.dirs,
-							&mut self.visible_errors
-						),
+						}) if *logs_displayed => {
+							let action = Self::logs_view(
+								ui,
+								logs_displayed,
+								instance,
+								&mut new_run,
+								&self.config.smapi_config,
+								&self.dirs,
+								&mut self.visible_errors
+							);
+
+							match action {
+								Some(LogViewAction::CloseInstance) => self.current_run = None,
+								None => ()
+							}
+						}
 						_ => self.mods_and_modgroup_area(ui)
 					}
 
@@ -315,42 +336,12 @@ impl App {
 				ui.heading("Mods");
 
 				egui::ScrollArea::vertical().show(ui, |ui| {
-					for m in self.all_mods.mods.values() {
-						ui.horizontal(|ui| {
-							ui.label(m.user_visible_name(&self.all_mods.mods));
-
-							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-								let dependents = self.all_mods.dependents.get(&m.unique_id);
-								let is_enabled = dependents.is_none_or(BTreeSet::is_empty);
-								let mut resp = ui
-									.add_enabled_ui(is_enabled, |ui| {
-										if ui.button("🗑").clicked() {
-											self.modal = Some(DisplayedModal::DeletingMod {
-												to_delete: m.unique_id.clone(),
-												also_delete: BTreeSet::default()
-											});
-										}
-									})
-									.response;
-
-								if let Some(deps) = dependents
-									&& !deps.is_empty()
-								{
-									let hover_text = format!(
-										"{} is required by {}",
-										m.name,
-										deps.iter()
-											.filter_map(|d| self.all_mods.mods.get(d))
-											.map(|m| m.user_visible_name(&self.all_mods.mods))
-											.collect::<Vec<_>>()
-											.join(", ")
-									);
-									resp = resp.on_disabled_hover_text(hover_text);
-								}
-
-								resp
-							});
-						});
+					for modd in self.all_mods.mods.values() {
+						if let Some(modal) =
+							mod_block(ui, modd, &mut self.expanded_mods, &self.all_mods)
+						{
+							self.modal = Some(modal);
+						}
 					}
 				});
 			}
@@ -371,75 +362,137 @@ impl App {
 				.as_ref()
 				.is_some_and(|r| r.instance.name == group.name);
 
-			ui.horizontal(|ui| {
-				if ui.button(&group.name).clicked() {
-					if let Some(RunningDisplay {
-						logs_displayed: _,
-						instance
-					}) = current_run.as_mut()
-					{
-						match instance.child.try_wait() {
-							Err(e) => visible_errors.push(format!(
-								"Couldn't check if currently-running instace of stardew (with pid {}) is actually still running: {e}. You should probably restart this app.",
-								instance.child.id()
-							)),
-							Ok(None) => (), // It's still running, whatever.
-							// TODO: Show this status somehow?
-							//
-							// If it already exited, then just hide it. Nice and easy.
-							Ok(Some(_)) => *current_run = None,
+			ui.add_space(6.);
+
+			let group_row = ui.vertical(|ui| {
+				ui.add_space(4.);
+
+				let resp = ui.horizontal(|ui| {
+					let resp = if this_is_running {
+						ui.spinner()
+					} else {
+						let btn = ui.button("⏵︎");
+						if btn.clicked() {
+							Self::modgroup_clicked(
+								ui,
+								group,
+								visible_errors,
+								current_run,
+								dirs,
+								config
+							);
 						}
-					}
+						btn
+					};
 
-					match &current_run {
-						None => match RunningInstance::try_new(
-							&group.name,
-							config,
-							// TODO: Allow selecting
-							dirs.stardew_paths.iter().next().unwrap(),
-							&dirs.modgroups_dir
-						) {
-							Ok(instance) => {
-								println!("got child with pid {}", instance.child.id());
-								*current_run = Some(RunningDisplay {
-									logs_displayed: true,
-									instance
-								});
-							}
-							Err(e) => panic!("{e}") // TODO: Handle
-						},
-						Some(RunningDisplay {
-							logs_displayed: _,
-							instance
-						}) => {
-							let modal = egui_modal::Modal::new(ui.ctx(), "try_run_failed");
-							modal.show(|ui| {
-								modal.title(ui, "Stardew Already Running");
+					ui.label(&group.name);
 
-								modal.frame(ui, |ui| {
-									modal.body(
-										ui,
-										format!(
-											"Stardew is already running under modgroup {}, and we can't run it twice at the same time. \n\nPlease close the currently running instance and try again",
-											instance.name
-										)
-									);
-								});
-
-								// TODO: Allow user to click a button to kill it and then send the
-								// child to a separate thread to kill and show updates in the UI
-								modal.suggested_button(ui, "OK");
-							});
-
-							modal.open();
+					let layout = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+						let delete_btn = ui.button("🗑");
+						if delete_btn.clicked() {
+							todo!();
 						}
-					}
-				}
 
-				if this_is_running {
-					ui.strong("(Running)");
-				}
+						let edit_btn = ui.button("🖉");
+						if edit_btn.clicked() {
+							todo!();
+						}
+
+						delete_btn.union(edit_btn)
+					});
+
+					layout.inner.union(layout.response).union(resp)
+				});
+
+				ui.add_space(4.);
+				resp.inner.union(resp.response)
 			});
+
+			let group_row = group_row.inner.union(group_row.response);
+
+			ui.painter_at(group_row.rect).rect_stroke(
+				group_row.rect,
+				CornerRadius {
+					nw: 4,
+					ne: 4,
+					sw: 4,
+					se: 4
+				},
+				Stroke {
+					color: Color32::DARK_BLUE,
+					width: 2.
+				},
+				egui::StrokeKind::Outside
+			);
+		}
+	}
+
+	fn modgroup_clicked(
+		ui: &mut egui::Ui,
+		group: &ModGroup,
+		visible_errors: &mut Vec<String>,
+		current_run: &mut Option<RunningDisplay>,
+		dirs: &dirs::Dirs,
+		config: &SmapiConfig
+	) {
+		if let Some(RunningDisplay {
+			logs_displayed: _,
+			instance
+		}) = current_run.as_mut()
+		{
+			match instance.child.try_wait() {
+				Err(e) => visible_errors.push(format!(
+					"Couldn't check if currently-running instace of stardew (with pid {}) is actually still running: {e}. You should probably restart this app.",
+					instance.child.id()
+				)),
+				Ok(None) => (), // It's still running, whatever.
+				// TODO: Show this status somehow?
+				//
+				// If it already exited, then just hide it. Nice and easy.
+				Ok(Some(_)) => *current_run = None,
+			}
+		}
+
+		match &current_run {
+			None => match RunningInstance::try_new(
+				&group.name,
+				config,
+				// TODO: Allow selecting
+				dirs.stardew_paths.iter().next().unwrap(),
+				&dirs.modgroups_dir
+			) {
+				Ok(instance) =>
+					*current_run = Some(RunningDisplay {
+						logs_displayed: true,
+						instance
+					}),
+				Err(e) => visible_errors.push(format!("Couldn't start stardew: {e}"))
+			},
+			Some(RunningDisplay {
+				logs_displayed: _,
+				instance
+			}) => {
+				let modal = egui_modal::Modal::new(ui.ctx(), "try_run_failed");
+				modal.show(|ui| {
+					modal.title(ui, "Stardew Already Running");
+
+					modal.frame(ui, |ui| {
+						modal.body(
+							ui,
+							format!(
+								"Stardew is already running under modgroup {}, and we can't run it twice at the same time. \n\nPlease close the currently running instance and try again",
+								instance.name
+							)
+						);
+					});
+
+					// TODO: Allow user to click a button to kill it and then send the
+					// child to a separate thread to kill and show updates in the UI
+					modal.suggested_button(ui, "OK");
+				});
+
+				modal.open();
+			}
 		}
 	}
 
@@ -495,7 +548,7 @@ impl App {
 						return;
 					};
 
-					let new_mod_dir = self.dirs.mod_dir.join(&new_mod.unique_id.0);
+					let new_mod_dir = self.dirs.mod_dir.join(&*new_mod.unique_id.0);
 					if let Err(e) = std::fs::create_dir(&new_mod_dir) {
 						self.visible_errors.push(format!(
 							"Couldn't make new directory for mod '{}' at {:?}: {e}",
@@ -532,7 +585,10 @@ impl App {
 		smapi_config: &SmapiConfig,
 		dirs: &Dirs,
 		visible_errors: &mut Vec<String>
-	) {
+	) -> Option<LogViewAction> {
+		let mut ret = None;
+		let exit_code = instance.child.try_wait();
+
 		ui.horizontal(|ui| {
 			ui.heading(format!("Currently running ModGroup '{}'", instance.name));
 			if ui.button("Hide Logs").clicked() {
@@ -547,6 +603,7 @@ impl App {
 						visible_errors
 							.push(format!("Couldn't kill currently-running stardew: {e}"));
 					};
+
 					*new_run = match RunningInstance::try_new(
 						&instance.name,
 						smapi_config,
@@ -560,10 +617,19 @@ impl App {
 							None
 						}
 					};
-				} else if ui.button("Stop Game").clicked()
-					&& let Err(e) = instance.child.kill()
-				{
-					visible_errors.push(format!("Couldn't kill stardew: {e}"));
+				} else {
+					match exit_code {
+						Ok(Some(_)) =>
+							if ui.button("Close Logs").clicked() {
+								ret = Some(LogViewAction::CloseInstance);
+							},
+						_ =>
+							if ui.button("Stop Game").clicked()
+								&& let Err(e) = instance.child.kill()
+							{
+								visible_errors.push(format!("Couldn't kill stardew: {e}"));
+							},
+					}
 				}
 			});
 
@@ -583,7 +649,7 @@ impl App {
 							))
 						};
 
-						match instance.child.try_wait() {
+						match exit_code {
 							Err(e) =>
 								_ = ui.label(format!(
 									"We can't determine if the process has exited or not: {e}"
@@ -595,6 +661,8 @@ impl App {
 					});
 			});
 		});
+
+		ret
 	}
 
 	fn new_modgroup_view(&mut self, ctx: &egui::Context) {
@@ -605,16 +673,6 @@ impl App {
 		let modal = egui_modal::Modal::new(ctx, "modal");
 		let mut create_button = None;
 		let mut cancel_button = None;
-
-		// let window_height = ctx.available_rect().height();
-		let whole_area = |ui: &egui::Ui| -> Vec2 {
-			/*vec2(
-				ui.available_width(),
-				//ui.available_height().min(window_height * 0.8)
-				ui.available_height() * 0.8
-			)*/
-			ui.available_size()
-		};
 
 		match displayed {
 			DisplayedModal::NewModGroup(new_group) => {
@@ -790,6 +848,137 @@ impl App {
 			}
 		}
 	}
+}
+
+enum LogViewAction {
+	CloseInstance
+}
+
+fn mod_block(
+	ui: &mut egui::Ui,
+	modd: &Mod,
+	expanded_mods: &mut BTreeSet<UniqueId>,
+	all_mods: &AllMods
+) -> Option<DisplayedModal> {
+	let mut ret = None;
+
+	let is_expanded = expanded_mods.contains(&modd.unique_id);
+
+	let mod_row = ui.vertical(|ui| {
+		let top_row = ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+			ui.add_space(5.);
+
+			let label_resp =
+				ui.add(Label::new(modd.user_visible_name(&all_mods.mods)).selectable(true));
+
+			ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+				let dependents = all_mods.dependents.get(&modd.unique_id);
+				let is_enabled = dependents.is_none_or(BTreeSet::is_empty);
+				let resp = ui.add_enabled_ui(is_enabled, |ui| {
+					let btn = ui.button("🗑");
+					if btn.clicked() {
+						ret = Some(DisplayedModal::DeletingMod {
+							to_delete: modd.unique_id.clone(),
+							also_delete: BTreeSet::default()
+						});
+					}
+					btn
+				});
+
+				let mut resp = resp.inner.union(resp.response);
+
+				if let Some(deps) = dependents
+					&& !deps.is_empty()
+				{
+					let hover_text = format!(
+						"{} is required by {}",
+						modd.name,
+						deps.iter()
+							.filter_map(|d| all_mods.mods.get(d))
+							.map(|m| m.user_visible_name(&all_mods.mods))
+							.collect::<Vec<_>>()
+							.join(", ")
+					);
+					resp = resp.on_disabled_hover_text(hover_text);
+				}
+
+				resp
+			})
+			.response
+			.union(label_resp)
+		});
+
+		let mut resp = top_row.inner.union(top_row.response);
+		if is_expanded {
+			ui.spacing_mut().item_spacing.y = 4.;
+
+			resp = ui
+				.label(format!("Made by {}, version {}", modd.author, modd.version))
+				.union(resp);
+			resp = ui.label(&modd.description).union(resp);
+
+			ui.add_space(8.);
+
+			resp = ui
+				.label(format!("Unique ID: {}", modd.unique_id))
+				.union(resp);
+			if let Some(ref api_vers) = modd.minimum_api_version {
+				resp = ui
+					.label(format!("Minimum required SMAPI version: {api_vers}"))
+					.union(resp);
+			}
+
+			if !modd.dependencies.is_empty() {
+				resp = ui.label("Dependencies:").union(resp);
+
+				for dep in &modd.dependencies {
+					resp = ui
+						.label(format!(
+							"{}{}",
+							all_mods
+								.mods
+								.get(&dep.unique_id)
+								.map_or(&*dep.unique_id.0, |m| &m.name),
+							if dep.is_required { "" } else { " (optional)" }
+						))
+						.union(resp);
+				}
+			}
+		}
+
+		resp
+	});
+
+	let mod_row = mod_row
+		.inner
+		.union(mod_row.response)
+		.interact(Sense::HOVER | Sense::CLICK);
+
+	if mod_row.hovered() {
+		let black = Color32::from_white_alpha(2);
+
+		ui.painter_at(mod_row.rect)
+			.add(Shape::Rect(RectShape::filled(
+				mod_row.rect,
+				CornerRadius {
+					nw: 4,
+					ne: 4,
+					sw: 4,
+					se: 4
+				},
+				black
+			)));
+	}
+
+	if mod_row.clicked() {
+		if is_expanded {
+			expanded_mods.remove(&modd.unique_id);
+		} else {
+			expanded_mods.insert(modd.unique_id.clone());
+		}
+	}
+
+	ret
 }
 
 fn list_mod(
