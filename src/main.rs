@@ -12,9 +12,10 @@ use std::{
 
 use eframe::NativeOptions;
 use egui::{
-	Align, Color32, CornerRadius, Label, Layout, Sense, Shape, Stroke, UiBuilder, Vec2,
-	epaint::RectShape, vec2
+	Align, Color32, CornerRadius, Label, Layout, Response, RichText, Sense, Stroke, UiBuilder,
+	Vec2, vec2
 };
+use egui_modal::Modal;
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -76,7 +77,11 @@ enum DisplayedModal {
 	DeletingMod {
 		to_delete: UniqueId,
 		also_delete: BTreeSet<UniqueId>
-	}
+	},
+	DeletingModgroup {
+		name: String
+	},
+	EditingModGroup(NewModGroup)
 }
 
 // a map of a unique id to every single mod that depends on it. We don't track whether it is
@@ -127,6 +132,47 @@ struct NewModGroup {
 	wip: ModGroup,
 	dependencies_expanded: BTreeSet<UniqueId>,
 	dependents: DependentsMap
+}
+
+impl NewModGroup {
+	fn add_mod(&mut self, modd: &Mod, all_mods: &BTreeMap<UniqueId, Mod>) {
+		self.wip.mods.insert(modd.unique_id.clone());
+		self.add_dependencies_for(modd, all_mods);
+	}
+
+	fn add_dependencies_for(&mut self, modd: &Mod, all_mods: &BTreeMap<UniqueId, Mod>) {
+		for dependency in &modd.dependencies {
+			if let Some(modd) = all_mods.get(&dependency.unique_id) {
+				match self.dependents.get_mut(&dependency.unique_id) {
+					Some(deps) => _ = deps.insert(modd.unique_id.clone()),
+					None =>
+						_ = self.dependents.insert(
+							dependency.unique_id.clone(),
+							BTreeSet::from_iter([modd.unique_id.clone()])
+						),
+				}
+
+				self.add_dependencies_for(modd, all_mods);
+			}
+		}
+	}
+
+	fn remove_mod(&mut self, modd: &Mod, all_mods: &BTreeMap<UniqueId, Mod>) {
+		self.wip.mods.remove(&modd.unique_id);
+		self.remove_dependencies_of(modd, all_mods);
+	}
+
+	fn remove_dependencies_of(&mut self, modd: &Mod, all_mods: &BTreeMap<UniqueId, Mod>) {
+		for set_of_dependents in self.dependents.values_mut() {
+			_ = set_of_dependents.remove(&modd.unique_id);
+		}
+
+		for dependency in &modd.dependencies {
+			if let Some(modd) = all_mods.get(&dependency.unique_id) {
+				self.remove_dependencies_of(modd, all_mods);
+			}
+		}
+	}
 }
 
 struct RunningDisplay {
@@ -227,7 +273,7 @@ impl eframe::App for App {
 		ctx.set_zoom_factor(self.config.zoom_factor);
 
 		self.check_if_discovered_new_mod();
-		self.new_modgroup_view(ctx);
+		self.modal_view(ctx);
 
 		egui::CentralPanel::default().show(ctx, |ui| {
 			ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
@@ -322,25 +368,29 @@ impl App {
 		split_horiz(
 			ui,
 			ui.available_height(),
-			|ui| {
-				Self::modgroup_area(
+			&mut self.modal,
+			|ui, modal| {
+				if let Some(new_modal) = Self::modgroup_area(
 					ui,
 					&self.modgroups,
+					&self.all_mods.mods,
 					&mut self.current_run,
 					&mut self.visible_errors,
 					&self.dirs,
 					&self.config.smapi_config
-				)
+				) {
+					*modal = Some(new_modal);
+				}
 			},
-			|ui| {
+			|ui, modal| {
 				ui.heading("Mods");
 
 				egui::ScrollArea::vertical().show(ui, |ui| {
 					for modd in self.all_mods.mods.values() {
-						if let Some(modal) =
+						if let Some(new_modal) =
 							mod_block(ui, modd, &mut self.expanded_mods, &self.all_mods)
 						{
-							self.modal = Some(modal);
+							*modal = Some(new_modal);
 						}
 					}
 				});
@@ -351,11 +401,14 @@ impl App {
 	fn modgroup_area(
 		ui: &mut egui::Ui,
 		modgroups: &BTreeSet<ModGroup>,
+		all_mods: &BTreeMap<UniqueId, Mod>,
 		current_run: &mut Option<RunningDisplay>,
 		visible_errors: &mut Vec<String>,
 		dirs: &Dirs,
 		config: &SmapiConfig
-	) {
+	) -> Option<DisplayedModal> {
+		let mut ret = None;
+
 		ui.heading("Mod Groups");
 		for group in modgroups {
 			let this_is_running = current_run
@@ -365,13 +418,19 @@ impl App {
 			ui.add_space(6.);
 
 			let group_row = ui.vertical(|ui| {
-				ui.add_space(4.);
+				let vert_pad = 6.;
+				let horiz_pad = visually_equiv_padding(vert_pad);
+
+				ui.add_space(vert_pad);
 
 				let resp = ui.horizontal(|ui| {
+					ui.add_space(horiz_pad);
+
 					let resp = if this_is_running {
 						ui.spinner()
 					} else {
-						let btn = ui.button("⏵︎");
+						// play button
+						let btn = ui.button("\u{25b6}");
 						if btn.clicked() {
 							Self::modgroup_clicked(
 								ui,
@@ -385,46 +444,73 @@ impl App {
 						btn
 					};
 
-					ui.label(&group.name);
+					let label = ui.label(&group.name);
 
 					let layout = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+						ui.add_space(horiz_pad);
+
 						let delete_btn = ui.button("🗑");
 						if delete_btn.clicked() {
-							todo!();
+							ret = Some(DisplayedModal::DeletingModgroup {
+								name: group.name.clone()
+							});
 						}
 
-						let edit_btn = ui.button("🖉");
-						if edit_btn.clicked() {
-							todo!();
+						// pencil icon
+						let edit_btn = ui.button("\u{270f}");
+						'clicked: {
+							if edit_btn.clicked() {
+								let mut new_group = NewModGroup::default();
+
+								for id in &group.mods {
+									let Some(modd) = all_mods.get(id) else {
+										visible_errors.push(format!("Couldn't repopulate list of mods in modgroup due to not being able to find mod with id '{id}'; did you uninstall it outside of prismatic?"));
+										break 'clicked;
+									};
+									new_group.add_mod(modd, all_mods);
+								}
+
+								ret = Some(DisplayedModal::EditingModGroup(new_group));
+							}
 						}
 
 						delete_btn.union(edit_btn)
 					});
 
-					layout.inner.union(layout.response).union(resp)
+					layout.inner.union(layout.response).union(resp).union(label)
 				});
 
-				ui.add_space(4.);
+				ui.add_space(vert_pad - 2.);
 				resp.inner.union(resp.response)
 			});
 
 			let group_row = group_row.inner.union(group_row.response);
 
-			ui.painter_at(group_row.rect).rect_stroke(
+			let painter = ui.painter_at(group_row.rect);
+
+			let corner_radius = CornerRadius {
+				nw: 6,
+				ne: 6,
+				sw: 6,
+				se: 6
+			};
+
+			painter.rect_stroke(
 				group_row.rect,
-				CornerRadius {
-					nw: 4,
-					ne: 4,
-					sw: 4,
-					se: 4
-				},
+				corner_radius,
 				Stroke {
-					color: Color32::DARK_BLUE,
-					width: 2.
+					width: 1.,
+					color: catppuccin_egui::MOCHA.lavender
 				},
-				egui::StrokeKind::Outside
+				egui::StrokeKind::Inside
 			);
+
+			if group_row.interact(Sense::HOVER).hovered() {
+				painter.rect_filled(group_row.rect, corner_radius, Color32::from_white_alpha(2));
+			}
 		}
+
+		ret
 	}
 
 	fn modgroup_clicked(
@@ -665,88 +751,45 @@ impl App {
 		ret
 	}
 
-	fn new_modgroup_view(&mut self, ctx: &egui::Context) {
+	fn modal_view(&mut self, ctx: &egui::Context) {
 		let Some(displayed) = &mut self.modal else {
 			return;
 		};
 
 		let modal = egui_modal::Modal::new(ctx, "modal");
-		let mut create_button = None;
+		let mut confirm_button = None;
 		let mut cancel_button = None;
 
 		match displayed {
 			DisplayedModal::NewModGroup(new_group) => {
-				modal.show(|ui| {
-					modal.title(ui, "New ModGroup");
+				modgroup_edit_ui(
+					&modal,
+					&mut cancel_button,
+					&mut confirm_button,
+					new_group,
+					&self.all_mods.mods,
+					NewOrEditing::New {
+						name_is_taken: self.modgroups.iter().any(|g| g.name == new_group.wip.name)
+					}
+				);
 
-					modal.frame(ui, |ui| {
-						ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-								cancel_button = Some(modal.caution_button(ui, "Cancel"));
-
-								ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-									create_button = Some(modal.suggested_button(ui, "Create!"));
-								});
-							});
-
-							ui.add_space(8.);
-
-							ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-								ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
-									ui.label("Name:");
-
-									ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-										ui.text_edit_singleline(&mut new_group.wip.name);
-									});
-								});
-
-								ui.add_space(8.);
-
-								egui::ScrollArea::vertical().show(ui, |ui| {
-									for (id, md) in &self.all_mods.mods {
-										list_mod(
-											ui,
-											id,
-											true,
-											Some(md),
-											&self.all_mods.mods,
-											0,
-											new_group
-										);
-									}
-								});
-							});
-						});
-					});
-				});
-
-				modal.open();
-
-				if create_button.is_some_and(|b| b.clicked()) {
-					let Some(DisplayedModal::NewModGroup(mut creating)) = self.modal.take() else {
+				if confirm_button.is_some_and(|b| b.clicked()) {
+					let Some(DisplayedModal::NewModGroup(creating)) = self.modal.take() else {
 						unreachable!(
 							"This should only be clickable if we're already creating a new mod group"
 						);
 					};
 
-					for key in creating.dependents.into_keys() {
-						creating.wip.mods.insert(key);
-					}
-
 					match make_files_for_modgroup(
 						&self.dirs.modgroups_dir,
 						&self.dirs.mod_dir,
-						creating.wip
+						creating
 					) {
 						Ok(group) => _ = self.modgroups.insert(group),
 						Err(ModGroupCreationErr { step, err }) => self
 							.visible_errors
 							.push(format!("Couldn't create modgroup: {step} ({err})",))
 					}
-				}
-
-				if cancel_button.is_some_and(|b| b.clicked()) {
-					self.modal = None;
 				}
 			}
 			DisplayedModal::DeletingMod {
@@ -766,7 +809,7 @@ impl App {
 								cancel_button = Some(modal.caution_button(ui, "Cancel"));
 
 								ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-									create_button = Some(modal.suggested_button(ui, "Delete!"));
+									confirm_button = Some(modal.suggested_button(ui, "Delete!"));
 								});
 							});
 
@@ -804,7 +847,7 @@ impl App {
 
 				modal.open();
 
-				if create_button.is_some_and(|b| b.clicked()) {
+				if confirm_button.is_some_and(|b| b.clicked()) {
 					let mut got_err = false;
 
 					for id in also_delete.iter().chain(std::iter::once(&*to_delete)) {
@@ -819,11 +862,63 @@ impl App {
 						self.modal = None;
 					}
 				}
+			}
+			DisplayedModal::DeletingModgroup { name } => {
+				modal.show(|ui| {
+					modal.title(ui, format!("Delete ModGroup '{name}'?"));
 
-				if cancel_button.is_some_and(|b| b.clicked()) {
+					modal.frame(ui, |ui| {
+						ui.label("Note: This won't delete any mods or stardew save data; it will only remove easy access to this configuration of mods");
+
+						ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+							cancel_button = Some(modal.suggested_button(ui, "Cancel"));
+
+							ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
+								confirm_button = Some(modal.caution_button(ui, "Delete!"));
+							});
+						});
+					});
+				});
+
+				modal.open();
+
+				if confirm_button.is_some_and(|b| b.clicked()) {
+					self.modgroups.retain(|g| &g.name != name);
 					self.modal = None;
 				}
 			}
+			DisplayedModal::EditingModGroup(group) => {
+				modgroup_edit_ui(
+					&modal,
+					&mut cancel_button,
+					&mut confirm_button,
+					group,
+					&self.all_mods.mods,
+					NewOrEditing::Editing
+				);
+
+				if confirm_button.is_some_and(|b| b.clicked()) {
+					let Some(DisplayedModal::EditingModGroup(mut creating)) = self.modal.take()
+					else {
+						unreachable!(
+							"This should only be clickable if we're editing a current mod group"
+						);
+					};
+
+					if let Err(e) = make_files_for_modgroup(
+						&self.dirs.modgroups_dir,
+						&self.dirs.mod_dir,
+						creating
+					) {
+						self.visible_errors
+							.push(format!("Couldn't save modgroup: {} ({})", e.step, e.err));
+					}
+				}
+			}
+		}
+
+		if cancel_button.is_some_and(|b| b.clicked()) {
+			self.modal = None;
 		}
 	}
 
@@ -852,6 +947,77 @@ impl App {
 
 enum LogViewAction {
 	CloseInstance
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum NewOrEditing {
+	New { name_is_taken: bool },
+	Editing
+}
+
+fn modgroup_edit_ui(
+	modal: &Modal,
+	cancel_button: &mut Option<Response>,
+	confirm_button: &mut Option<Response>,
+	group: &mut NewModGroup,
+	all_mods: &BTreeMap<UniqueId, Mod>,
+	new_or_editing: NewOrEditing
+) {
+	modal.show(|ui| {
+		modal.title(ui, "New ModGroup");
+
+		modal.frame(ui, |ui| {
+			ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+				ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+					*cancel_button = Some(modal.caution_button(ui, "Cancel"));
+
+					ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
+						let (confirm_text, enable_ui) = match new_or_editing {
+							NewOrEditing::Editing => ("Save Changes", true),
+							NewOrEditing::New { name_is_taken } => ("Create!", !name_is_taken)
+						};
+
+						ui.add_enabled_ui(enable_ui, |ui| {
+							*confirm_button = Some(modal.suggested_button(ui, confirm_text));
+						});
+					});
+				});
+
+				ui.add_space(8.);
+
+				ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+					ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+						ui.label("Name:");
+
+						ui.add_enabled_ui(new_or_editing != NewOrEditing::Editing, |ui| {
+							ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+								ui.text_edit_singleline(&mut group.wip.name);
+							});
+						});
+					});
+
+					if let NewOrEditing::New {
+						name_is_taken: true
+					} = new_or_editing
+					{
+						ui.label(
+							RichText::new("Modgroup name is alredy taken").color(Color32::RED)
+						);
+					}
+
+					ui.add_space(8.);
+
+					egui::ScrollArea::vertical().show(ui, |ui| {
+						for (id, md) in all_mods {
+							list_mod(ui, id, true, Some(md), all_mods, 0, group);
+						}
+					});
+				});
+			});
+		});
+	});
+
+	modal.open();
 }
 
 fn mod_block(
@@ -910,40 +1076,50 @@ fn mod_block(
 
 		let mut resp = top_row.inner.union(top_row.response);
 		if is_expanded {
-			ui.spacing_mut().item_spacing.y = 4.;
+			resp = left_padding(ui, 10., |ui| {
+				ui.spacing_mut().item_spacing.y = 4.;
 
-			resp = ui
-				.label(format!("Made by {}, version {}", modd.author, modd.version))
-				.union(resp);
-			resp = ui.label(&modd.description).union(resp);
+				let mut resp =
+					ui.label(format!("Made by {}, version {}", modd.author, modd.version));
+				resp = ui.label(&modd.description).union(resp);
 
-			ui.add_space(8.);
+				ui.add_space(8.);
 
-			resp = ui
-				.label(format!("Unique ID: {}", modd.unique_id))
-				.union(resp);
-			if let Some(ref api_vers) = modd.minimum_api_version {
 				resp = ui
-					.label(format!("Minimum required SMAPI version: {api_vers}"))
+					.label(format!("Unique ID: {}", modd.unique_id))
 					.union(resp);
-			}
-
-			if !modd.dependencies.is_empty() {
-				resp = ui.label("Dependencies:").union(resp);
-
-				for dep in &modd.dependencies {
+				if let Some(ref api_vers) = modd.minimum_api_version {
 					resp = ui
-						.label(format!(
-							"{}{}",
-							all_mods
-								.mods
-								.get(&dep.unique_id)
-								.map_or(&*dep.unique_id.0, |m| &m.name),
-							if dep.is_required { "" } else { " (optional)" }
-						))
+						.label(format!("Minimum required SMAPI version: {api_vers}"))
 						.union(resp);
 				}
-			}
+
+				if !modd.dependencies.is_empty() {
+					resp = ui.label("Dependencies:").union(resp);
+
+					resp = left_padding(ui, 10., |ui| {
+						for dep in &modd.dependencies {
+							resp = ui
+								.label(format!(
+									"{}{}",
+									all_mods
+										.mods
+										.get(&dep.unique_id)
+										.map_or(&*dep.unique_id.0, |m| &m.name),
+									if dep.is_required { "" } else { " (optional)" }
+								))
+								.union(resp);
+						}
+
+						resp
+					});
+				}
+
+				ui.add_space(5.);
+
+				resp
+			})
+			.union(resp);
 		}
 
 		resp
@@ -955,19 +1131,16 @@ fn mod_block(
 		.interact(Sense::HOVER | Sense::CLICK);
 
 	if mod_row.hovered() {
-		let black = Color32::from_white_alpha(2);
-
-		ui.painter_at(mod_row.rect)
-			.add(Shape::Rect(RectShape::filled(
-				mod_row.rect,
-				CornerRadius {
-					nw: 4,
-					ne: 4,
-					sw: 4,
-					se: 4
-				},
-				black
-			)));
+		ui.painter_at(mod_row.rect).rect_filled(
+			mod_row.rect,
+			CornerRadius {
+				nw: 4,
+				ne: 4,
+				sw: 4,
+				se: 4
+			},
+			Color32::from_white_alpha(2)
+		);
 	}
 
 	if mod_row.clicked() {
@@ -1015,11 +1188,9 @@ fn list_mod(
 						.clicked()
 					{
 						if contains {
-							new_group.wip.mods.remove(&modd.unique_id);
-							remove_mod_and_dependencies(modd, all_mods, &mut new_group.dependents);
+							new_group.remove_mod(modd, all_mods);
 						} else {
-							new_group.wip.mods.insert(modd.unique_id.clone());
-							add_mod_and_dependencies(modd, all_mods, &mut new_group.dependents);
+							new_group.add_mod(modd, all_mods);
 						}
 					}
 
@@ -1093,43 +1264,6 @@ fn list_mod_as_dependent_to_delete(
 		});
 
 		list_mod_as_dependent_to_delete(ui, indent_level + 1, installed, also_delete, all_mods);
-	}
-}
-
-fn remove_mod_and_dependencies(
-	modd: &Mod,
-	all_mods: &BTreeMap<UniqueId, Mod>,
-	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
-) {
-	for set_of_dependents in dependents.values_mut() {
-		_ = set_of_dependents.remove(&modd.unique_id);
-	}
-
-	for dependency in &modd.dependencies {
-		if let Some(modd) = all_mods.get(&dependency.unique_id) {
-			remove_mod_and_dependencies(modd, all_mods, dependents);
-		}
-	}
-}
-
-fn add_mod_and_dependencies(
-	modd: &Mod,
-	all_mods: &BTreeMap<UniqueId, Mod>,
-	dependents: &mut BTreeMap<UniqueId, BTreeSet<UniqueId>>
-) {
-	for dependency in &modd.dependencies {
-		match dependents.get_mut(&dependency.unique_id) {
-			Some(deps) => _ = deps.insert(modd.unique_id.clone()),
-			None =>
-				_ = dependents.insert(
-					dependency.unique_id.clone(),
-					BTreeSet::from_iter([modd.unique_id.clone()])
-				),
-		}
-
-		if let Some(modd) = all_mods.get(&dependency.unique_id) {
-			add_mod_and_dependencies(modd, all_mods, dependents);
-		}
 	}
 }
 
@@ -1268,11 +1402,12 @@ pub fn in_rect(
 	children(&mut new_ui);
 }
 
-pub fn split_horiz(
+pub fn split_horiz<T>(
 	ui: &mut egui::Ui,
 	height: f32,
-	left: impl FnOnce(&mut egui::Ui),
-	right: impl FnOnce(&mut egui::Ui)
+	input: &mut T,
+	left: impl FnOnce(&mut egui::Ui, &mut T),
+	right: impl FnOnce(&mut egui::Ui, &mut T)
 ) {
 	let width = ui.available_width() / 2.;
 	ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
@@ -1284,7 +1419,7 @@ pub fn split_horiz(
 			Layout::top_down(Align::LEFT),
 			|ui| {
 				ui.spacing_mut().item_spacing.x = orig;
-				left(ui);
+				left(ui, input);
 			}
 		);
 		in_rect(
@@ -1293,8 +1428,29 @@ pub fn split_horiz(
 			Layout::top_down(Align::LEFT),
 			|ui| {
 				ui.spacing_mut().item_spacing.x = orig;
-				right(ui);
+				right(ui, input);
 			}
 		);
 	});
+}
+
+fn left_padding(
+	ui: &mut egui::Ui,
+	pad: f32,
+	f: impl FnOnce(&mut egui::Ui) -> Response
+) -> Response {
+	let h = ui.horizontal(|ui| {
+		ui.add_space(pad);
+
+		let v = ui.vertical(f);
+
+		v.inner.union(v.response)
+	});
+
+	h.inner.union(h.response)
+}
+
+// returns the horizontal padding to make things look nice if you have the given vertical padding
+pub fn visually_equiv_padding(vert_pad: f32) -> f32 {
+	vert_pad * 1.2
 }

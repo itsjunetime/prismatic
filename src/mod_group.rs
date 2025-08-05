@@ -6,7 +6,7 @@ use std::{
 	sync::{Arc, mpsc::Sender}
 };
 
-use crate::{AppMsg, dirs::Dirs, make_dir_symlink};
+use crate::{AppMsg, NewModGroup, dirs::Dirs, make_dir_symlink};
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -395,6 +395,13 @@ pub enum FailedCreation {
 		mod_id: UniqueId,
 		found_at: Box<Path>,
 		link_to: Box<Path>
+	},
+	OldContentRemoval {
+		dir: Box<Path>
+	},
+	WholeDirMove {
+		from: Box<Path>,
+		to: Box<Path>
 	}
 }
 
@@ -424,6 +431,14 @@ impl Display for FailedCreation {
 			} => write!(
 				f,
 				"couldn't make symlink from {found_at:?} to {link_to:?} to associate mod {mod_id} with this modgroup"
+			),
+			Self::OldContentRemoval { dir } => write!(
+				f,
+				"couldn't clean up the data that used to sit at {dir:?} (where we need to put the new modgroup)"
+			),
+			Self::WholeDirMove { from, to } => write!(
+				f,
+				"couldn't copy whole modgroup dir from {from:?} to {to:?} as the final atomic step in creation"
 			)
 		}
 	}
@@ -435,17 +450,29 @@ pub struct ModGroupCreationErr {
 }
 
 pub fn make_files_for_modgroup(
-	modgroup_dir: &Path,
-	mod_dir: &Path,
-	group: ModGroup
+	modgroups_dir: &Path,
+	mods_dir: &Path,
+	mut group: NewModGroup
 ) -> Result<ModGroup, ModGroupCreationErr> {
-	let ModGroup { name, mods } = group;
+	for key in group.dependents.into_keys() {
+		group.wip.mods.insert(key);
+	}
 
-	let modgroup_path = modgroup_dir.join(&name);
+	let ModGroup { name, mods } = group.wip;
 
-	if let Err(err) = std::fs::create_dir(&modgroup_path) {
+	let tmp_path = modgroups_dir
+		.parent()
+		.expect(
+			"The modgroup dir is not like. the root directory. If it is, something has gone terribly wrong"
+		)
+		.join("modgroup_creation")
+		.join(&name);
+
+	let modgroup_path = modgroups_dir.join(&name);
+
+	if let Err(err) = std::fs::create_dir(&tmp_path) {
 		return Err(ModGroupCreationErr {
-			step: FailedCreation::ModGroupFolderCreation(modgroup_path.into()),
+			step: FailedCreation::ModGroupFolderCreation(tmp_path.into()),
 			err
 		});
 	}
@@ -454,7 +481,7 @@ pub fn make_files_for_modgroup(
 		let mods = mods
 			.into_iter()
 			.map(|id| {
-				let real_dir = mod_dir.join(&*id.0);
+				let real_dir = mods_dir.join(&*id.0);
 
 				match std::fs::exists(&real_dir) {
 					Err(e) =>
@@ -480,7 +507,7 @@ pub fn make_files_for_modgroup(
 					Ok(true) => ()
 				}
 
-				let link = modgroup_path.join(&*id.0);
+				let link = tmp_path.join(&*id.0);
 				match make_dir_symlink(&real_dir, &link) {
 					Err(err) => Err(ModGroupCreationErr {
 						step: FailedCreation::ModSymlink {
@@ -495,12 +522,55 @@ pub fn make_files_for_modgroup(
 			})
 			.collect::<Result<BTreeSet<_>, _>>()?;
 
+		// only linux gets atomicity here 'cause it's the only one that makes it even slightly easy
+		// to reach for. I can't, for the life of me, figure out how one would do this on windows.
+		#[cfg(target_os = "linux")]
+		{
+			use nix::fcntl::RenameFlags;
+
+			let stdout = std::io::stdout();
+
+			// fun fact: if both the paths are absolute, then the fds are ignored. So since we know
+			// we're passing in absolute paths, we can just give it a cheap & lazy fd: stdin!
+			nix::fcntl::renameat2(&stdout, &tmp_path, &stdout, &modgroup_path, RenameFlags::RENAME_EXCHANGE)
+				.map_err(|err| ModGroupCreationErr {
+					step: FailedCreation::WholeDirMove {
+						from: tmp_path.clone().into(),
+						to: modgroup_path.into()
+					},
+					err: err.into(),
+				})?;
+
+			// we don't care if this fails, I guess. we're just best-effort cleaning up here.
+			_ = std::fs::remove_dir_all(&tmp_path);
+		}
+
+		#[cfg(not(target_os = "linux"))]
+		{
+			if std::fs::exists(&modgroup_path).is_some_and(|b| b) {
+				std::fs::remove_dir_all(modgroup_path).map_err(|e| ModGroupCreationErr {
+					step: FailedCreation::OldContentRemoval {
+						dir: modgroup_path.into()
+					},
+					err
+				})?;
+			}
+
+			std::fs::rename(&tmp_path, &modgroup_path).map_err(|err| ModGroupCreationErr {
+				step: FailedCreation::WholeDirMove {
+					from: tmp_path.clone().into(),
+					to: modgroup_path.into()
+				},
+				err
+			})?;
+		}
+
 		Ok(ModGroup { mods, name })
 	};
 
 	// if we fail when creating the other symlinks or whatever, make sure to clean up after
 	// ourselves.
-	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(modgroup_path))
+	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(tmp_path))
 }
 
 pub fn delete_mod(

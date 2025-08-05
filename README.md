@@ -14,6 +14,7 @@ A ***VERY*** work-in-progress Mod manager for Stardew Valley.
 - [ ] Updating/Downgrading of Mods
 - [ ] Selection of which installed version of Stardew to run (e.g. Steam vs GOG vs wherever else)
 - [ ] Nice-to-look-at UI
+- [ ] 'Cleanup' of modgroups (remove all mods that aren't installed anymore)
 
 ## Why use this instead of *Other Stardew Mod Manager*?
 1. All others that I looked at didn't support arm/aarch64 linux
