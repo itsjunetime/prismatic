@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 egui = { version = "0.31", features = ["accesskit", "log", "rayon"] }
-ureq = { version = "3", features = ["brotli", "platform-verifier"] }
+ureq = { version = "3", features = ["brotli", "platform-verifier", "cookies", "json"] }
 eframe = "0.31"
 dirs = "6"
 semver = "1.0.26"
@@ -20,15 +20,7 @@ tokio = { version = "1.46", features = ["rt-multi-thread", "fs"] }
 futures = "0.3"
 kdl = "6"
 nix = { version = "0.30", features = ["fs"] }
-
-# for chrom
-chromiumoxide = "0.7"
-serde_json = "*"
-
-# all for headless_chrome
-# headless_chrome = "1"
-# serde_json = "*"
-# anyhow = "*"
+zip = { version = "4.3", default-features = false }
 
 [lints.clippy]
 uninlined_format_args = "warn"

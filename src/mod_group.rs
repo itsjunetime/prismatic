@@ -6,6 +6,8 @@ use std::{
 	sync::{Arc, mpsc::Sender}
 };
 
+use nix::NixPath;
+
 use crate::{AppMsg, NewModGroup, dirs::Dirs, make_dir_symlink};
 
 #[derive(serde::Deserialize)]
@@ -396,20 +398,15 @@ pub enum FailedCreation {
 		found_at: Box<Path>,
 		link_to: Box<Path>
 	},
-	OldContentRemoval {
-		dir: Box<Path>
-	},
-	WholeDirMove {
-		from: Box<Path>,
-		to: Box<Path>
-	}
+	DirMove(OverwriteErrStep)
 }
 
 impl Display for FailedCreation {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::ModGroupFolderCreation(path) =>
-				write!(f, "couldn't create main folder for modgroup at {path:?}"),
+			Self::ModGroupFolderCreation(path) => {
+				write!(f, "couldn't create main folder for modgroup at {path:?}")
+			}
 			Self::CantCheckIfModExists {
 				mod_id,
 				expected_at
@@ -432,14 +429,16 @@ impl Display for FailedCreation {
 				f,
 				"couldn't make symlink from {found_at:?} to {link_to:?} to associate mod {mod_id} with this modgroup"
 			),
-			Self::OldContentRemoval { dir } => write!(
-				f,
-				"couldn't clean up the data that used to sit at {dir:?} (where we need to put the new modgroup)"
-			),
-			Self::WholeDirMove { from, to } => write!(
-				f,
-				"couldn't copy whole modgroup dir from {from:?} to {to:?} as the final atomic step in creation"
-			)
+			Self::DirMove(step) => match step {
+				OverwriteErrStep::OldContentRemoval { dir } => write!(
+					f,
+					"couldn't clean up the data that used to sit at {dir:?} (where we need to put the new modgroup)"
+				),
+				OverwriteErrStep::WholeDirMove { from, to } => write!(
+					f,
+					"couldn't copy whole modgroup dir from {from:?} to {to:?} as the final atomic step in creation"
+				)
+			}
 		}
 	}
 }
@@ -522,48 +521,12 @@ pub fn make_files_for_modgroup(
 			})
 			.collect::<Result<BTreeSet<_>, _>>()?;
 
-		// only linux gets atomicity here 'cause it's the only one that makes it even slightly easy
-		// to reach for. I can't, for the life of me, figure out how one would do this on windows.
-		#[cfg(target_os = "linux")]
-		{
-			use nix::fcntl::RenameFlags;
-
-			let stdout = std::io::stdout();
-
-			// fun fact: if both the paths are absolute, then the fds are ignored. So since we know
-			// we're passing in absolute paths, we can just give it a cheap & lazy fd: stdin!
-			nix::fcntl::renameat2(&stdout, &tmp_path, &stdout, &modgroup_path, RenameFlags::RENAME_EXCHANGE)
-				.map_err(|err| ModGroupCreationErr {
-					step: FailedCreation::WholeDirMove {
-						from: tmp_path.clone().into(),
-						to: modgroup_path.into()
-					},
-					err: err.into(),
-				})?;
-
-			// we don't care if this fails, I guess. we're just best-effort cleaning up here.
-			_ = std::fs::remove_dir_all(&tmp_path);
-		}
-
-		#[cfg(not(target_os = "linux"))]
-		{
-			if std::fs::exists(&modgroup_path).is_some_and(|b| b) {
-				std::fs::remove_dir_all(modgroup_path).map_err(|e| ModGroupCreationErr {
-					step: FailedCreation::OldContentRemoval {
-						dir: modgroup_path.into()
-					},
-					err
-				})?;
-			}
-
-			std::fs::rename(&tmp_path, &modgroup_path).map_err(|err| ModGroupCreationErr {
-				step: FailedCreation::WholeDirMove {
-					from: tmp_path.clone().into(),
-					to: modgroup_path.into()
-				},
+		overwrite_dir_with_other(&*tmp_path, &modgroup_path).map_err(|(s, err)| {
+			ModGroupCreationErr {
+				step: FailedCreation::DirMove(s),
 				err
-			})?;
-		}
+			}
+		})?;
 
 		Ok(ModGroup { mods, name })
 	};
@@ -571,6 +534,70 @@ pub fn make_files_for_modgroup(
 	// if we fail when creating the other symlinks or whatever, make sure to clean up after
 	// ourselves.
 	do_the_rest().inspect_err(|_| _ = std::fs::remove_dir_all(tmp_path))
+}
+
+pub enum OverwriteErrStep {
+	WholeDirMove { from: Box<Path>, to: Box<Path> },
+	OldContentRemoval { dir: Box<Path> }
+}
+
+// both orig and new must be absolute. This overwrites the contents of `orig` with the contents of
+// `new`. This is atomic on linux, not atomic on everything else 'cuase I can't figure out how.
+pub fn overwrite_dir_with_other(
+	orig: &(impl AsRef<Path> + NixPath + ?Sized),
+	new: &(impl AsRef<Path> + NixPath + ?Sized)
+) -> Result<(), (OverwriteErrStep, std::io::Error)> {
+	// only linux gets atomicity here 'cause it's the only one that makes it even slightly easy
+	// to reach for. I can't, for the life of me, figure out how one would do this on windows.
+	#[cfg(target_os = "linux")]
+	{
+		use nix::fcntl::RenameFlags;
+
+		let stdout = std::io::stdout();
+
+		// fun fact: if both the paths are absolute, then the fds are ignored. So since we know
+		// we're passing in absolute paths, we can just give it a cheap & lazy fd: stdin!
+		nix::fcntl::renameat2(&stdout, orig, &stdout, new, RenameFlags::RENAME_EXCHANGE).map_err(
+			|err| {
+				(
+					OverwriteErrStep::WholeDirMove {
+						from: orig.as_ref().into(),
+						to: new.as_ref().into()
+					},
+					err.into()
+				)
+			}
+		)?;
+
+		// we don't care if this fails, I guess. we're just best-effort cleaning up here.
+		_ = std::fs::remove_dir_all(&orig);
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	{
+		if std::fs::exists(&new).is_some_and(|b| b) {
+			std::fs::remove_dir_all(new).map_err(|e| {
+				(
+					OverwriteErrStep::OldContentRemoval {
+						dir: modgroup_path.into()
+					},
+					err
+				)
+			})?;
+		}
+
+		std::fs::rename(&orig, &new).map_err(|err| {
+			(
+				OverwriteErrStep::WholeDirMove {
+					from: tmp_path.clone().into(),
+					to: modgroup_path.into()
+				},
+				err
+			)
+		})?;
+	}
+
+	Ok(())
 }
 
 pub fn delete_mod(

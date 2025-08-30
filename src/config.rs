@@ -86,10 +86,11 @@ impl FileConfig {
 		{
 			match delete_after_copy {
 				KdlValue::Bool(val) => wip.mod_detection.delete_after_copy = *val,
-				_ =>
+				_ => {
 					return Err(format!(
 						"`mod_detection.delete_after_copy` must be a boolean value (either `true` or `false`) - found {delete_after_copy:?}"
-					)),
+					));
+				}
 			}
 		}
 

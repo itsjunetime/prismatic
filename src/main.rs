@@ -12,8 +12,8 @@ use std::{
 
 use eframe::NativeOptions;
 use egui::{
-	Align, Color32, CornerRadius, Label, Layout, Response, RichText, Sense, Stroke, UiBuilder,
-	Vec2, vec2
+	Align, Color32, CornerRadius, FontId, Label, Layout, Response, RichText, Sense, Stroke,
+	TextFormat, UiBuilder, Vec2, text::LayoutJob, vec2
 };
 use egui_modal::Modal;
 use tokio::runtime::Runtime;
@@ -21,7 +21,6 @@ use tokio::runtime::Runtime;
 use crate::{
 	config::{FileConfig, SmapiConfig},
 	dirs::{Dirs, get_modgroups_from_data_dir},
-	fetch::{BrowserMessage, launch_browser},
 	mod_group::{
 		Mod, ModGroup, ModGroupCreationErr, UniqueId, collect_mods_in_path, delete_mod,
 		make_files_for_modgroup
@@ -68,8 +67,7 @@ struct App {
 	current_run: Option<RunningDisplay>,
 	modal: Option<DisplayedModal>,
 	discovering_new_mods_from: Option<Receiver<AppMsg>>,
-	config: FileConfig,
-	browser: Option<BrowserSession>
+	config: FileConfig
 }
 
 enum DisplayedModal {
@@ -81,7 +79,10 @@ enum DisplayedModal {
 	DeletingModgroup {
 		name: String
 	},
-	EditingModGroup(NewModGroup)
+	EditingModGroup(NewModGroup),
+	PastingModLinks {
+		links: Vec<String>
+	}
 }
 
 // a map of a unique id to every single mod that depends on it. We don't track whether it is
@@ -180,11 +181,6 @@ struct RunningDisplay {
 	instance: RunningInstance
 }
 
-pub struct BrowserSession {
-	task: tokio::task::JoinHandle<()>,
-	receiver: Receiver<BrowserMessage>
-}
-
 // It's fine to have large variants here 'cause these should only ever be present within a
 // `Sender`/`Receiver` pair, meaning that they'd already be on the heap. So Boxing the biggest
 // variant would allow the allocation that this resides in to be smaller, but would make us do 2
@@ -258,8 +254,7 @@ impl Default for App {
 			current_run: None,
 			modal: None,
 			discovering_new_mods_from: None,
-			config,
-			browser: None
+			config // browser: None
 		}
 	}
 }
@@ -306,24 +301,29 @@ impl eframe::App for App {
 							*logs_displayed = true;
 						}
 
-						ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-							/*ui.add_enabled_ui(self.browser.is_none(), |ui| {
-								if ui.button("Log In!").clicked() {
-									self.spawn_browser();
-								}
-							});*/
+						ui.add_enabled_ui(self.modal.is_none(), |ui| {
+							ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+								/*ui.add_enabled_ui(self.browser.is_none(), |ui| {
+									if ui.button("Log In!").clicked() {
+										self.spawn_browser();
+									}
+								});*/
 
-							ui.add_enabled_ui(self.modal.is_none(), |ui| {
+								if ui.button("+ Download Mods").clicked() {
+									self.modal =
+										Some(DisplayedModal::PastingModLinks { links: vec![] });
+								}
+
 								if ui.button("+ New ModGroup").clicked() {
 									self.modal =
 										Some(DisplayedModal::NewModGroup(NewModGroup::default()));
 								}
-							});
 
-							if ui.button("+ Mod (from computer)").clicked() {
-								self.discovering_new_mods_from =
-									start_discovering_new_mods_on_fs(&self.runtime);
-							}
+								if ui.button("+ Mod (from computer)").clicked() {
+									self.discovering_new_mods_from =
+										start_discovering_new_mods_on_fs(&self.runtime);
+								}
+							});
 						})
 					});
 
@@ -470,6 +470,7 @@ impl App {
 									new_group.add_mod(modd, all_mods);
 								}
 
+								new_group.wip.name = group.name.clone();
 								ret = Some(DisplayedModal::EditingModGroup(new_group));
 							}
 						}
@@ -709,12 +710,13 @@ impl App {
 							if ui.button("Close Logs").clicked() {
 								ret = Some(LogViewAction::CloseInstance);
 							},
-						_ =>
+						_ => {
 							if ui.button("Stop Game").clicked()
 								&& let Err(e) = instance.child.kill()
 							{
 								visible_errors.push(format!("Couldn't kill stardew: {e}"));
-							},
+							}
+						}
 					}
 				}
 			});
@@ -796,71 +798,20 @@ impl App {
 				to_delete,
 				also_delete
 			} => {
-				let modd = self.all_mods.mods.get(to_delete).unwrap();
+				let resp = mod_deletion_ui(
+					modal,
+					&mut cancel_button,
+					&to_delete,
+					also_delete,
+					&self.modgroups,
+					&self.all_mods,
+					&self.dirs
+				);
 
-				// we're assuming you can only get to this point if it's actually ok to delete this
-				// mod (i.e. it's not required by anything else)
-				modal.show(|ui| {
-					modal.title(ui, format!("Delete {}?", modd.name));
-
-					modal.frame(ui, |ui| {
-						ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-							ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
-								cancel_button = Some(modal.caution_button(ui, "Cancel"));
-
-								ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
-									confirm_button = Some(modal.suggested_button(ui, "Delete!"));
-								});
-							});
-
-							ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-								let in_any_groups = self.modgroups.iter().any(|g| g.mods.contains(to_delete));
-								if in_any_groups {
-									ui.label("Warning: Deleting this mod will remove it from the following modgroups as well:");
-									for group in &self.modgroups {
-										if !group.mods.contains(to_delete) {
-											continue;
-										}
-
-										ui.horizontal(|ui| {
-											ui.add_space(10.);
-											ui.label(&group.name);
-										});
-									}
-
-									ui.add_space(20.);
-								}
-
-								if modd.dependencies.is_empty() {
-									ui.label("Are you sure you want to delete this mod?");
-								} else {
-									ui.label(format!("This mod requires some other mods that you won't need to keep around anymore once this mod is gone. Select which ones you also want to delete along with {}", modd.name));
-
-									egui::ScrollArea::vertical().show(ui, |ui| {
-										list_mod_as_dependent_to_delete(ui, 0, modd, also_delete, &self.all_mods);
-									});
-								}
-							});
-						});
-					});
-				});
-
-				modal.open();
-
-				if confirm_button.is_some_and(|b| b.clicked()) {
-					let mut got_err = false;
-
-					for id in also_delete.iter().chain(std::iter::once(&*to_delete)) {
-						if let Err(e) = delete_mod(to_delete, &self.dirs, &self.modgroups) {
-							got_err = true;
-							self.visible_errors
-								.push(format!("Can't delete mod with id {id}: {e}"));
-						}
-					}
-
-					if !got_err {
-						self.modal = None;
-					}
+				match resp {
+					Some(Err(errs)) => self.visible_errors.extend(errs),
+					Some(Ok(())) => self.modal = None,
+					None => ()
 				}
 			}
 			DisplayedModal::DeletingModgroup { name } => {
@@ -898,8 +849,7 @@ impl App {
 				);
 
 				if confirm_button.is_some_and(|b| b.clicked()) {
-					let Some(DisplayedModal::EditingModGroup(mut creating)) = self.modal.take()
-					else {
+					let Some(DisplayedModal::EditingModGroup(creating)) = self.modal.take() else {
 						unreachable!(
 							"This should only be clickable if we're editing a current mod group"
 						);
@@ -915,32 +865,58 @@ impl App {
 					}
 				}
 			}
+			DisplayedModal::PastingModLinks { links } => {
+				let mut to_remove = None;
+
+				modal.show(|ui| {
+					modal.title(ui, "Paste NexusMods links here");
+
+					modal.frame(ui, |ui| {
+						let mut job = LayoutJob::default();
+						job.append(
+							"These links should look something like ",
+							0.,
+							TextFormat::default()
+						);
+						job.append(
+							"https://www.nexusmods.com/stardewvalley/mods/3753",
+							0.,
+							TextFormat::simple(FontId::default(), Color32::BLUE)
+						);
+						job.append(
+							", where `3753` is the mod id for Stardew Valley Expanded",
+							0.,
+							TextFormat::default()
+						);
+
+						ui.label(job);
+
+						egui::ScrollArea::vertical().show(ui, |ui| {
+							for (idx, link) in (&mut *links).into_iter().enumerate() {
+								ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+									ui.text_edit_singleline(link);
+
+									if ui.button("🗑️").clicked() {
+										to_remove = Some(idx);
+									}
+								});
+							}
+
+							if ui.button("+").clicked() {
+								links.push(String::new());
+							}
+						});
+					});
+				});
+
+				if let Some(remove_idx) = to_remove {
+					links.remove(remove_idx);
+				}
+			}
 		}
 
 		if cancel_button.is_some_and(|b| b.clicked()) {
 			self.modal = None;
-		}
-	}
-
-	fn spawn_browser(&mut self) {
-		match self.browser.take() {
-			// drop the receiver, we won't need it once we abort the task
-			Some(BrowserSession { task, receiver: _ }) => {
-				task.abort();
-			}
-			None => {
-				let (sender, receiver) = mpsc::channel();
-
-				let task = self.runtime.spawn(async move {
-					if let Err(e) = launch_browser(&sender).await {
-						println!("got err: {e}");
-						_ = sender.send(BrowserMessage::Error(format!(
-							"Couldn't launch browser: {e}"
-						)));
-					}
-				});
-				self.browser = Some(BrowserSession { task, receiver });
-			}
 		}
 	}
 }
@@ -964,7 +940,10 @@ fn modgroup_edit_ui(
 	new_or_editing: NewOrEditing
 ) {
 	modal.show(|ui| {
-		modal.title(ui, "New ModGroup");
+		match new_or_editing {
+			NewOrEditing::New { name_is_taken: _ } => modal.title(ui, "New ModGroup"),
+			NewOrEditing::Editing => modal.title(ui, format!("Editing {}", group.wip.name))
+		}
 
 		modal.frame(ui, |ui| {
 			ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
@@ -986,15 +965,15 @@ fn modgroup_edit_ui(
 				ui.add_space(8.);
 
 				ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-					ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
-						ui.label("Name:");
+					if matches!(new_or_editing, NewOrEditing::New { .. }) {
+						ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
+							ui.label("Name:");
 
-						ui.add_enabled_ui(new_or_editing != NewOrEditing::Editing, |ui| {
 							ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
 								ui.text_edit_singleline(&mut group.wip.name);
 							});
 						});
-					});
+					}
 
 					if let NewOrEditing::New {
 						name_is_taken: true
@@ -1267,6 +1246,80 @@ fn list_mod_as_dependent_to_delete(
 	}
 }
 
+fn mod_deletion_ui(
+	modal: Modal,
+	cancel_button: &mut Option<Response>,
+	to_delete: &UniqueId,
+	also_delete: &mut BTreeSet<UniqueId>,
+	modgroups: &BTreeSet<ModGroup>,
+	all_mods: &AllMods,
+	dirs: &Dirs
+) -> Option<Result<(), Vec<String>>> {
+	let mut confirm_button = None;
+	let modd = all_mods.mods.get(to_delete).unwrap();
+
+	// we're assuming you can only get to this point if it's actually ok to delete this
+	// mod (i.e. it's not required by anything else)
+	modal.show(|ui| {
+		modal.title(ui, format!("Delete {}?", modd.name));
+
+		modal.frame(ui, |ui| {
+			ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+				ui.with_layout(Layout::left_to_right(Align::BOTTOM), |ui| {
+					*cancel_button = Some(modal.caution_button(ui, "Cancel"));
+
+					ui.with_layout(Layout::right_to_left(Align::BOTTOM), |ui| {
+						confirm_button = Some(modal.suggested_button(ui, "Delete!"));
+					});
+				});
+
+				ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+					let in_any_groups = modgroups.iter().any(|g| g.mods.contains(to_delete));
+					if in_any_groups {
+						ui.label("Warning: Deleting this mod will remove it from the following modgroups as well:");
+						for group in modgroups {
+							if !group.mods.contains(to_delete) {
+								continue;
+							}
+
+							ui.horizontal(|ui| {
+								ui.add_space(10.);
+								ui.label(&group.name);
+							});
+						}
+
+						ui.add_space(20.);
+					}
+
+					if modd.dependencies.is_empty() {
+						ui.label("Are you sure you want to delete this mod?");
+					} else {
+						ui.label(format!("This mod requires some other mods that you won't need to keep around anymore once this mod is gone. Select which ones you also want to delete along with {}", modd.name));
+
+						egui::ScrollArea::vertical().show(ui, |ui| {
+							list_mod_as_dependent_to_delete(ui, 0, modd, also_delete, &all_mods);
+						});
+					}
+				});
+			});
+		});
+	});
+
+	modal.open();
+
+	confirm_button.filter(|b| b.clicked()).map(|_| {
+		let mut errs = vec![];
+
+		for id in also_delete.iter().chain(std::iter::once(&*to_delete)) {
+			if let Err(e) = delete_mod(to_delete, &dirs, &modgroups) {
+				errs.push(format!("Can't delete mod with id {id}: {e}"));
+			}
+		}
+
+		if errs.is_empty() { Ok(()) } else { Err(errs) }
+	})
+}
+
 fn make_dir_symlink(original: &Path, link: &Path) -> std::io::Result<()> {
 	if std::fs::exists(link)? {
 		let points_to = read_link(link)?;
@@ -1332,11 +1385,13 @@ impl Display for CopyDirError {
 				f,
 				"Couldn't read the metadata of a file that exists inside {parent:?}"
 			),
-			Self::NoFileType { item_path } =>
-				write!(f, "Couldn't get the filetype of the item at {item_path:?}"),
+			Self::NoFileType { item_path } => {
+				write!(f, "Couldn't get the filetype of the item at {item_path:?}")
+			}
 			Self::CopyFile { from, to } => write!(f, "Couldn't copy file from {from:?} to {to:?}"),
-			Self::MakeChildDir { new_dir } =>
-				write!(f, "Couldn't make new directory for mod at {new_dir:?}"),
+			Self::MakeChildDir { new_dir } => {
+				write!(f, "Couldn't make new directory for mod at {new_dir:?}")
+			}
 		}
 	}
 }

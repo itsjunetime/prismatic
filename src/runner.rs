@@ -128,10 +128,10 @@ impl RunningInstance {
 
 		if let Some(vars) = config.custom_env.as_ref() {
 			for env in vars {
-				_ = match env {
+				match env {
 					EnvVar::Add { key, value } => cmd.env(key, value),
 					EnvVar::Remove { key } => cmd.env_remove(key)
-				}
+				};
 			}
 		}
 
